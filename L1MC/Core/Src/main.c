@@ -21,7 +21,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -65,8 +67,8 @@ uint16_t motor_R = STOP_SPEED;
 
 // Encoder variables
 #define ENCODER_RES 20
-volatile uint32_t encoder_right_count = 0;
-volatile uint32_t encoder_left_count = 0;
+volatile int16_t encoder_right_count = 0;
+volatile int16_t encoder_left_count = 0;
 
 // Distance sensors
 #define NUM_SAMPLES 16
@@ -84,6 +86,30 @@ const uint8_t dmux_channels[3] = {0, 1, 7}; // active DMUX channels
 #define DMUX_B_PIN GPIO_PIN_4
 #define DMUX_C_PIN GPIO_PIN_5
 #define DMUX_PORT GPIOB
+
+// Serial communication with ESP8266
+uint8_t rxByte;
+char rxBuffer[64];
+uint8_t rxIndex = 0;
+volatile uint8_t msgReady = 0;
+
+// Robot geometry
+#define WHEEL_RADIUS 0.0225f   // [m]  wheel radius (6 cm)
+#define WHEEL_BASE   0.14f   // [m]  distance between wheel centers
+
+// Robot pose (in meters and radians)
+float robot_x = 0.0f;
+float robot_y = 0.0f;
+float robot_theta = 0.0f;
+
+// Remote control
+uint8_t command = 'S';
+uint8_t state = 'I';
+uint32_t param1, param2, last_tick;
+int32_t running_cmd = 0;
+
+// goto xy
+float xt,yt;
 
 /* USER CODE END PV */
 
@@ -139,7 +165,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         // TIM2 expired - check if PA7 is still HIGH
         if(HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_7) == GPIO_PIN_SET)
         {
-            encoder_right_count++;  // Valid signal, increment counter
+    		// Valid signal, increment counter
+        	uint32_t cms = __HAL_TIM_GET_COMPARE(&htim3, TIM_CHANNEL_1); // current motor speed
+        	if (cms < STOP_SPEED) // motor right rotates forward
+        		encoder_right_count++;
+        	else
+        		encoder_right_count--;
         }
         HAL_TIM_Base_Stop_IT(&htim2);  // Stop timer
     }
@@ -148,7 +179,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         // TIM5 expired - check if PA5 is still HIGH
         if(HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_5) == GPIO_PIN_SET)
         {
-            encoder_left_count++;  // Valid signal, increment counter
+    		// Valid signal, increment counter
+        	uint32_t cms = __HAL_TIM_GET_COMPARE(&htim4, TIM_CHANNEL_1); // current motor speed
+        	if (cms > STOP_SPEED) // motor left rotates forward (backward, but physically reversed)
+        		encoder_left_count++;
+        	else
+        		encoder_left_count--;
         }
         HAL_TIM_Base_Stop_IT(&htim5);  // Stop timer
     }
@@ -161,6 +197,42 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, NUM_SAMPLES);
     }
 }
+
+// Odometry calculations
+void update_odometry(void) {
+    static int32_t prev_left = 0;
+    static int32_t prev_right = 0;
+
+    int32_t curr_left = encoder_left_count;
+    int32_t curr_right = encoder_right_count;
+
+    // Encoder deltas
+    int32_t delta_left_counts  = curr_left - prev_left;
+    int32_t delta_right_counts = curr_right - prev_right;
+
+    prev_left  = curr_left;
+    prev_right = curr_right;
+
+    // Convert to distance [m]
+    float distance_left  = (2.0f * M_PI * WHEEL_RADIUS / ENCODER_RES) * delta_left_counts;
+    float distance_right = (2.0f * M_PI * WHEEL_RADIUS / ENCODER_RES) * delta_right_counts;
+
+    // Compute linear and angular displacement
+    float delta_s = (distance_right + distance_left) / 2.0f;
+    float delta_theta = (distance_right - distance_left) / WHEEL_BASE;
+
+    // Update robot pose
+    robot_x += delta_s * cosf(robot_theta + delta_theta / 2.0f + M_PI / 2.0f);
+    robot_y += delta_s * sinf(robot_theta + delta_theta / 2.0f + M_PI / 2.0f);
+    robot_theta += delta_theta;
+
+    // Keep theta within -π ... π
+    if (robot_theta > M_PI)
+        robot_theta -= 2.0f * M_PI;
+    else if (robot_theta < -M_PI)
+        robot_theta += 2.0f * M_PI;
+}
+
 // -----------------------------------------------------------------------------
 // Function to set DMUX address
 void Set_DMUX_Address(uint8_t address)
@@ -229,7 +301,19 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
         HAL_TIM_Base_Start_IT(&htim9);     // Start timer with interrupt
     }
 }
-// ------------------------------------------------------------ Distance sensors reading
+// ------------------------------------------------------------ Serial connection to the Wifi cheap
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+	if (huart == &huart1) {
+		if (rxByte == '\n') {
+			rxBuffer[rxIndex] = '\0';
+			msgReady = 1;
+			rxIndex = 0;
+		} else if (rxIndex < 63) {
+			rxBuffer[rxIndex++] = rxByte;
+		}
+		HAL_UART_Receive_IT(&huart1, &rxByte, 1); // Re-enable
+    }
+}
 
 // -------------------------------------------------------------------------------------
 
@@ -279,13 +363,16 @@ int main(void)
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
   set_M_speeds(STOP_SPEED, STOP_SPEED);
-//  set_M_speeds(MAX_F_SPEED, MAX_F_SPEED); // CCW
-//  set_M_speeds(MAX_B_SPEED, MAX_B_SPEED); // CW
+//  set_M_speeds(MAX_B_SPEED, MAX_B_SPEED); // CCW
+//  set_M_speeds(MAX_F_SPEED, MAX_F_SPEED); // CW
 //  set_M_speeds(MAX_F_SPEED, MAX_B_SPEED); // F
 //  set_M_speeds(MAX_B_SPEED, MAX_F_SPEED); // B
 
   // Init ADC and its DMAs for distance sensors
   ADC_Scan_Init();
+
+  // set interrupt for USART1
+  HAL_UART_Receive_IT(&huart1, &rxByte, 1);
 
   /* USER CODE END 2 */
 
@@ -294,26 +381,134 @@ int main(void)
   uint8_t rotating = 0;
   while (1)
   {
-	  if(adc_readings[0] > 350 || adc_readings[1] > 350 || adc_readings[2] > 350)
+	  if (command == 'W') // random move
 	  {
-		  if(rotating == 0)
+		  state = 'R'; // move random
+		  last_tick = HAL_GetTick();
+	  }
+	  else if (command == 'F') // move forward for a duration
+	  {
+		  state = 'C'; // continue this command
+		  last_tick = HAL_GetTick();
+		  set_M_speeds(MAX_F_SPEED, MAX_B_SPEED); // F
+		  running_cmd = param1;
+	  }
+	  else if (command == 'R') // rotate CW
+	  {
+		  state = 'C'; // continue this command
+		  last_tick = HAL_GetTick();
+		  set_M_speeds(MAX_F_SPEED, MAX_F_SPEED); // CW
+		  running_cmd = param1;
+	  }
+	  else if (command == 'L') // rotate CW
+	  {
+		  state = 'C'; // continue this command
+		  last_tick = HAL_GetTick();
+		  set_M_speeds(MAX_B_SPEED, MAX_B_SPEED); // CCW
+		  running_cmd = param1;
+	  }
+	  else if (command == 'M') // rotate CW
+	  {
+		  state = 'M'; // move to param1,param2
+		  xt = param1 / 1000.0f;
+		  yt = param2 / 1000.0f;
+		  last_tick = HAL_GetTick();
+		  set_M_speeds(STOP_SPEED, STOP_SPEED); // stay for now
+		  running_cmd = param1;
+	  }
+	  else if (command == 'S') // stop
+	  {
+		  state = 'I'; // idle, do nothing
+		  set_M_speeds(STOP_SPEED, STOP_SPEED);
+	  }
+	  command = 'I';
+
+	  if (state == 'R') // random move
+	  {
+		  // play around
+		  if(adc_readings[0] > 350 || adc_readings[1] > 350 || adc_readings[2] > 350)
 		  {
-			  rotating = 1;
-			  if(adc_readings[1] > adc_readings[2])
-				  set_M_speeds(MAX_B_SPEED, MAX_B_SPEED); // CCW
+			  if(rotating == 0)
+			  {
+				  rotating = 1;
+				  if(adc_readings[1] > adc_readings[2])
+					  set_M_speeds(MAX_B_SPEED, MAX_B_SPEED); // CCW
+				  else
+					  set_M_speeds(MAX_F_SPEED, MAX_F_SPEED); // CW
+			  }
 			  else
-				  set_M_speeds(MAX_F_SPEED, MAX_F_SPEED); // CW
+			  {
+				  HAL_Delay(10);
+			  }
 		  }
 		  else
 		  {
+			  rotating = 0;
+			  set_M_speeds(MAX_F_SPEED, MAX_B_SPEED); // F
 			  HAL_Delay(10);
 		  }
 	  }
-	  else
+	  else if (state == 'C')
 	  {
-		  rotating = 0;
-		  set_M_speeds(MAX_F_SPEED, MAX_B_SPEED); // F
-		  HAL_Delay(10);
+		  if (running_cmd <= (HAL_GetTick() - last_tick))
+			  command = 'S'; // stop
+	  }
+	  else if (state == 'M')
+	  {
+		  float dx=xt-robot_x, dy=yt-robot_y;
+		  float dist=sqrtf(dx*dx+dy*dy);
+		  if(dist<0.05){
+			  command = 'S'; // stop
+		  }
+		  float tyaw=atan2f(dy,dx);
+		  float err=tyaw-(robot_theta+M_PI/2.0f);
+		  while(err>M_PI)err-=2*M_PI;
+		  while(err<-M_PI)err+=2*M_PI;
+
+		  if(fabsf(err)>0.1){
+		    if(err>0)
+		    	set_M_speeds(MAX_B_SPEED,MAX_B_SPEED);
+		    else
+		    	set_M_speeds(MAX_F_SPEED,MAX_F_SPEED);
+		  }else{
+		    set_M_speeds(MAX_F_SPEED,MAX_B_SPEED);
+		  }
+		  // HAL_Delay(10);
+	  }
+
+	  // update odometry
+	  update_odometry();
+
+	  // handle serial communication if needed
+	  if (msgReady) {
+	      msgReady = 0;
+
+	      // Check if it's UPOSE command
+	      if (strncmp(rxBuffer, "UPOSE#", 6) == 0) {
+	          float new_x, new_y, new_theta;
+
+	          // Parse: "UPOSE#x#y#theta"
+	          if (sscanf(rxBuffer, "UPOSE#%f#%f#%f", &new_x, &new_y, &new_theta) == 3) {
+
+	              // Reply with CURRENT pose before updating
+	              char response[64];
+	              sprintf(response, "%.2f#%.2f#%.2f\n", robot_x, robot_y, robot_theta);
+	              HAL_UART_Transmit(&huart1, (uint8_t*)response, strlen(response), 100);
+
+	              // Now update robot memory with new values
+	              robot_x = new_x;
+	              robot_y = new_y;
+	              robot_theta = new_theta;
+	          }
+	      } else if (strncmp(rxBuffer, "GPOSE#", 6) == 0) {
+	    	  // Reply with CURRENT pose before updating
+			  char response[64];
+			  sprintf(response, "%.2f#%.2f#%.2f\n", robot_x, robot_y, robot_theta);
+			  HAL_UART_Transmit(&huart1, (uint8_t*)response, strlen(response), 100);
+	      } else if (strncmp(rxBuffer, "CMD#", 4) == 0) {
+	    	  // receive command
+	    	  sscanf(rxBuffer, "CMD#%c#%ld#%ld", &command, &param1, &param2);
+	      }
 	  }
     /* USER CODE END WHILE */
 
