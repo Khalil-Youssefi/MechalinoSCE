@@ -21,7 +21,10 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <math.h>
 /* USER CODE END Includes */
@@ -52,20 +55,20 @@ TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim5;
 TIM_HandleTypeDef htim9;
+TIM_HandleTypeDef htim10;
 
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-// Motors speeds
+// Motors
 #define STOP_SPEED 1500
 #define MAX_B_SPEED 1300
 #define MAX_F_SPEED 1700
-
 uint16_t motor_L = STOP_SPEED;
 uint16_t motor_R = STOP_SPEED;
 
-// Encoder variables
+// Encoder
 #define ENCODER_RES 20
 volatile int16_t encoder_right_count = 0;
 volatile int16_t encoder_left_count = 0;
@@ -79,7 +82,6 @@ volatile uint16_t adc_readings[3];  // active DMUX channels are 0, 1 and 7 [diff
 uint8_t current_step = 0; // step 0: IR LED off, step 1: IR LED on
 uint8_t current_dmux_index = 0;
 const uint8_t dmux_channels[3] = {0, 1, 7}; // active DMUX channels
-
 // DMUX control pins
 #define DMUX_EN  GPIO_PIN_1
 #define DMUX_A_PIN GPIO_PIN_3
@@ -91,25 +93,61 @@ const uint8_t dmux_channels[3] = {0, 1, 7}; // active DMUX channels
 uint8_t rxByte;
 char rxBuffer[64];
 uint8_t rxIndex = 0;
-volatile uint8_t msgReady = 0;
+volatile uint8_t poseReady = 0;
+volatile uint8_t cmdReady  = 0;
+char poseBuffer[64];
+char cmdBuffer[64];
 
-// Robot geometry
+
+// Robot geometry and pose (in meters and radians)
+// geometry
 #define WHEEL_RADIUS 0.0225f   // [m]  wheel radius (6 cm)
 #define WHEEL_BASE   0.14f   // [m]  distance between wheel centers
-
-// Robot pose (in meters and radians)
+// pose
 float robot_x = 0.0f;
 float robot_y = 0.0f;
 float robot_theta = 0.0f;
+uint8_t invalid_pose = 1;
+volatile uint8_t odom_due = 0; // flag to request odom update
+volatile uint32_t cam_due  = 0; // flag for request cam pose update
+// cam pose
+#define POSE_LPF_ALPHA  0.8f
+#define POSE_WAIT_MS    1000u
+#define STOP_SETTLE_MS  150u
 
 // Remote control
-uint8_t command = 'S';
-uint8_t state = 'I';
-uint32_t param1, param2, last_tick;
-int32_t running_cmd = 0;
+char command = 'X';
+uint8_t new_cmd = 0;
+float params[5];
+uint32_t cmd_end;
+
+// ---------------- GOTO XY ----------------
+typedef enum {
+    GOTO_IDLE = 0,
+    GOTO_ROTATE,
+    GOTO_DRIVE,
+    GOTO_DONE
+} goto_state_t;
+
+volatile goto_state_t goto_state = GOTO_IDLE;
+
+// thresholds
+#define GOTO_THETA_OK_RAD        (3.0f * (float)M_PI / 180.0f)    // rotate until <= 5 deg
+#define GOTO_THETA_DRIVE_MAX_RAD (5.0f * (float)M_PI / 180.0f)   // while driving, must stay within 10 deg
+#define GOTO_DIST_OK_M           (0.02f)                          // 2 cm stop distance
+
+// drive/rotate speeds for goto (can tune later)
+#define GOTO_ROT_CW_L   (MAX_F_SPEED)
+#define GOTO_ROT_CW_R   (MAX_F_SPEED)
+#define GOTO_ROT_CCW_L  (MAX_B_SPEED)
+#define GOTO_ROT_CCW_R  (MAX_B_SPEED)
+#define GOTO_FWD_L      (MAX_F_SPEED)
+#define GOTO_FWD_R      (MAX_B_SPEED)
 
 // goto xy
-float xt,yt;
+float xt,yt,thetat,distt;
+float grid[8][2] = {{0.3f,0.15f},{1.65f,0.15f},{1.65f,0.3f},{0.15f,0.3f},{0.15f,0.45f},{1.65f,0.45f},{1.65f,0.6f},{0.15f,0.6f}};
+uint8_t BF_grid_index;
 
 /* USER CODE END PV */
 
@@ -126,6 +164,7 @@ static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM9_Init(void);
+static void MX_TIM10_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -196,15 +235,28 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         // Restart ADC+DMA for next reading
         HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, NUM_SAMPLES);
     }
-}
+    if (htim == &htim10)
+    {
+    	// request update odometry every 10ms (100Hz) [done in the main loop]
+    	odom_due++;
 
+    	static uint16_t div200 = 0;
+		if (++div200 >= 200) {     // 2 seconds @ 100 Hz
+			div200 = 0;
+			cam_due++;
+		}
+    }
+}
 // Odometry calculations
 void update_odometry(void) {
+	uint32_t primask = __get_PRIMASK();
+	__disable_irq();
+	int16_t curr_left  = encoder_left_count;
+	int16_t curr_right = encoder_right_count;
+	__set_PRIMASK(primask);
+
     static int32_t prev_left = 0;
     static int32_t prev_right = 0;
-
-    int32_t curr_left = encoder_left_count;
-    int32_t curr_right = encoder_right_count;
 
     // Encoder deltas
     int32_t delta_left_counts  = curr_left - prev_left;
@@ -232,7 +284,97 @@ void update_odometry(void) {
     else if (robot_theta < -M_PI)
         robot_theta += 2.0f * M_PI;
 }
+// cam pose
+static int parse_pose_reply(const char *s, float *x, float *y, float *th)
+{
+    // very strict format; returns 1 on success
+    // "POSE %f %f %f"
+    return (sscanf(s, "POS#%f#%f#%f", x, y, th) == 3) ? 1 : 0;
+}
+static void lpf_update_pose(float x_meas, float y_meas, float th_meas)
+{
+	// onlt the very first cam pose must be used as an absoloute update (reset state)
+	if (invalid_pose)
+	{
+		robot_x = x_meas;
+		robot_y = y_meas;
+		robot_theta = th_meas;
+		invalid_pose = 0;
+	}
+	else
+	{
+		// LPF for x,y
+		robot_x = (1.0f - POSE_LPF_ALPHA) * robot_x + POSE_LPF_ALPHA * x_meas;
+		robot_y = (1.0f - POSE_LPF_ALPHA) * robot_y + POSE_LPF_ALPHA * y_meas;
 
+		// LPF for angle with wrap handling (use shortest angle difference)
+		float d = th_meas - robot_theta;
+		while (d >  M_PI) d -= 2.0f * M_PI;
+		while (d < -M_PI) d += 2.0f * M_PI;
+
+		robot_theta += POSE_LPF_ALPHA * d;
+	}
+
+    // normalize robot_theta * even for abs update
+    if (robot_theta >  M_PI) robot_theta -= 2.0f * M_PI;
+    if (robot_theta < -M_PI) robot_theta += 2.0f * M_PI;
+}
+void do_camera_correction(void)
+{
+	// if command P as active, then don't poll cam pose, because of Serial conflicts
+	if (command == 'P')
+		return;
+
+    // 1) motor_L and motor_R keep current commanded motor PWM "speeds"
+
+    // 2) stop robot
+    set_M_speeds(STOP_SPEED, STOP_SPEED);
+
+    // 3) let mechanics settle
+    HAL_Delay(STOP_SETTLE_MS);
+
+    // 4) request pose from ESP (serial)
+    const char req[] = "POSE?\n";
+    (void)HAL_UART_Transmit(&huart1, (uint8_t*)req, (uint16_t)(sizeof(req) - 1), 50);
+
+    // 5) wait for reply (max POSE_WAIT_MS); if no reply -> ignore
+    // Clear any previous message atomically
+    {
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        poseReady = 0;
+        poseBuffer[0] = '\0';
+        __set_PRIMASK(primask);
+    }
+
+    uint32_t t0 = HAL_GetTick();
+    while ((HAL_GetTick() - t0) < POSE_WAIT_MS)
+    {
+        if (poseReady)
+        {
+            char local[64];
+
+            // copy buffer atomically and clear flag
+            uint32_t primask = __get_PRIMASK();
+            __disable_irq();
+            poseReady = 0;
+            strncpy(local, poseBuffer, sizeof(local));
+            local[sizeof(local) - 1] = '\0';
+            __set_PRIMASK(primask);
+
+            float x_meas, y_meas, th_meas;
+            if (parse_pose_reply(local, &x_meas, &y_meas, &th_meas))
+            {
+                // 6) update pose with LPF
+                lpf_update_pose(x_meas, y_meas, th_meas);
+            }
+            break; // either parsed or ignored; in both cases stop waiting
+        }
+    }
+
+    // 7) resume motion (restore previous PWM commands)
+    set_M_speeds(motor_L, motor_R);
+}
 // -----------------------------------------------------------------------------
 // Function to set DMUX address
 void Set_DMUX_Address(uint8_t address)
@@ -301,20 +443,490 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
         HAL_TIM_Base_Start_IT(&htim9);     // Start timer with interrupt
     }
 }
+
 // ------------------------------------------------------------ Serial connection to the Wifi cheap
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-	if (huart == &huart1) {
-		if (rxByte == '\n') {
+	if (huart == &huart1)
+	{
+		if (rxByte == '\n')
+		{
 			rxBuffer[rxIndex] = '\0';
-			msgReady = 1;
+
+			// Classify message by prefix
+			if (strncmp(rxBuffer, "CMD#", 4) == 0)
+			{
+				// Only copy if slot is free (avoid overwriting an unprocessed command)
+				if (!cmdReady)
+				{
+					strncpy(cmdBuffer, rxBuffer, sizeof(cmdBuffer));
+					cmdBuffer[sizeof(cmdBuffer) - 1] = '\0';
+					cmdReady = 1;
+				}
+				// else drop it
+			}
+			else if (strncmp(rxBuffer, "POS#", 4) == 0)
+			{
+				if (!poseReady)
+				{
+					strncpy(poseBuffer, rxBuffer, sizeof(poseBuffer));
+					poseBuffer[sizeof(poseBuffer) - 1] = '\0';
+					poseReady = 1;
+				}
+			}
+			else
+			{
+				// drop it
+			}
 			rxIndex = 0;
-		} else if (rxIndex < 63) {
+		}
+		else if (rxIndex < (sizeof(rxBuffer) - 1))
+		{
 			rxBuffer[rxIndex++] = rxByte;
 		}
-		HAL_UART_Receive_IT(&huart1, &rxByte, 1); // Re-enable
+		else
+		{
+			// Overflow: reset line
+			rxIndex = 0;
+		}
+
+		HAL_UART_Receive_IT(&huart1, &rxByte, 1);
+	}
+}
+void parse_command_if_ready(void)
+{
+    if (!cmdReady) return;
+
+    char local[64];
+
+    // ---- atomic snapshot of command buffer ----
+    {
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        cmdReady = 0;
+        strncpy(local, cmdBuffer, sizeof(local));
+        local[sizeof(local) - 1] = '\0';
+        __set_PRIMASK(primask);
+    }
+
+    // ---- parse cmd ----
+    char *s = local + 4;                 // points to "<cmd>#..."
+    if (*s == '\0') return;
+    new_cmd = 1;                         // mark it as a new command
+
+    command = *s++;
+    if (*s != '#') return;               // must be "CMD#<cmd>#"
+    s++;                                 // now points to first param (or '\0')
+
+    // ---- parse up to 5 params (as double -> float) ----
+    int   nparams = 0;
+
+    while (nparams < 5 && *s != '\0')
+    {
+        // find token end
+        char *end = strchr(s, '#');
+        if (end) *end = '\0';            // temporarily terminate this token
+
+        // skip empty tokens
+        while (isspace((unsigned char)*s)) s++;
+
+        if (*s != '\0')
+        {
+            // strtod handles both ints and floats (and scientific notation)
+            char *conv_end = NULL;
+            double val = strtod(s, &conv_end);
+
+            // accept only if token is a valid number (allow trailing spaces)
+            while (conv_end && isspace((unsigned char)*conv_end)) conv_end++;
+
+            if (conv_end && *conv_end == '\0')
+            {
+                params[nparams++] = (float)val;
+            }
+            else
+            {
+                // invalid number token -> stop parsing further params
+                break;
+            }
+        }
+
+        if (!end) break;                 // no more tokens
+        s = end + 1;                     // next token start
     }
 }
 
+static float wrap_pi(float a)
+{
+    while (a >  (float)M_PI) a -= 2.0f * (float)M_PI;
+    while (a < -(float)M_PI) a += 2.0f * (float)M_PI;
+    return a;
+}
+
+// Your odom uses (robot_theta + pi/2) in cos/sin, so robot_theta=0 points along +Y.
+// Bearing phi = atan2(dy,dx) is standard; desired theta in your convention is phi - pi/2.
+static float desired_theta_to_target(float x, float y, float th, float tx, float ty)
+{
+    (void)x; (void)y; (void)th;
+    float dx = tx - x;
+    float dy = ty - y;
+    float phi = atan2f(dy, dx);              // standard world bearing
+    float th_des = phi - (float)M_PI_2;      // convert to your theta convention
+    return wrap_pi(th_des);
+}
+
+static float heading_error_to_target(float x, float y, float th, float tx, float ty)
+{
+    float th_des = desired_theta_to_target(x, y, th, tx, ty);
+    return wrap_pi(th - th_des);
+}
+
+static float dist_to_target(float x, float y, float tx, float ty)
+{
+    float dx = tx - x;
+    float dy = ty - y;
+    return sqrtf(dx*dx + dy*dy);
+}
+void handle_command(void)
+{
+	if (command != 'X')
+	{
+	  uint32_t now = HAL_GetTick();
+
+	  if (command == 'S')
+	  {
+		  set_M_speeds(STOP_SPEED, STOP_SPEED);
+		  motor_L = STOP_SPEED;
+		  motor_R = STOP_SPEED;
+		  command = 'X';
+		  new_cmd = 0;
+	  }
+	  else if (command == 'M')
+	  {
+		  if (new_cmd)
+		  {
+			  // params[0] = speedL (PWM)
+			  // params[1] = speedR (PWM)
+			  // params[2] = duration_ms
+
+			  motor_L = (uint16_t)params[0];
+			  motor_R = (uint16_t)params[1];
+
+			  cmd_end = now + (uint32_t)params[2];
+
+			  set_M_speeds(motor_L, motor_R);
+
+			  new_cmd = 0;
+		  }
+		  else
+		  {
+			  // check if cmd_end reached
+			  if ((int32_t)(now - cmd_end) >= 0)
+			  {
+				  set_M_speeds(STOP_SPEED, STOP_SPEED);
+				  motor_L = STOP_SPEED;
+				  motor_R = STOP_SPEED;
+				  command = 'X';
+			  }
+		  }
+	  }
+	  else if (command == 'R')
+	  {
+		  if (new_cmd)
+		  {
+			  // params[0] = 'R' or 'L'
+			  // params[1] = duration_ms
+
+			  if (params[0] == 1.0f)
+			  {
+				  // CW
+				  motor_L = MAX_F_SPEED;
+				  motor_R = MAX_F_SPEED;
+			  }
+			  else if (params[0] == 2.0f)
+			  {
+				  // CCW
+				  motor_L = MAX_B_SPEED;
+				  motor_R = MAX_B_SPEED;
+			  }
+
+			  cmd_end = now + (uint32_t)params[1];
+
+			  set_M_speeds(motor_L, motor_R);
+
+			  new_cmd = 0;
+		  }
+		  else
+		  {
+			  if ((int32_t)(now - cmd_end) >= 0)
+			  {
+				  set_M_speeds(STOP_SPEED, STOP_SPEED);
+				  motor_L = STOP_SPEED;
+				  motor_R = STOP_SPEED;
+				  command = 'X';
+			  }
+		  }
+	  }
+	  else if (command == 'P')
+	  {
+	      char tx[64];
+	      int len;
+
+	      // snapshot pose atomically
+	      float x, y, th;
+	      {
+	          uint32_t primask = __get_PRIMASK();
+	          __disable_irq();
+	          x  = robot_x;
+	          y  = robot_y;
+	          th = robot_theta;
+	          __set_PRIMASK(primask);
+	      }
+
+	      // format: x#y#theta\n
+	      len = snprintf(tx, sizeof(tx), "%f#%f#%f", x, y, th);
+
+	      if (len > 0)
+	      {
+	          HAL_UART_Transmit(&huart1, (uint8_t*)tx, (uint16_t)len, 50);
+	      }
+
+	      command = 'X';
+	      new_cmd = 0;
+	  }
+	  else if (command == 'T')
+	  {
+	      if (new_cmd)
+	      {
+	          // params[0] = target_x (float, meters)
+	          // params[1] = target_y (float, meters)
+	          xt = params[0];
+	          yt = params[1];
+
+	          goto_state = GOTO_ROTATE;   // start by rotating to face target
+	          new_cmd = 0;
+	      }
+
+	      // run one step each loop
+	      gotoXY();
+
+	      // when done, clear command
+	      if (goto_state == GOTO_DONE)
+	      {
+	          goto_state = GOTO_IDLE;
+	          command = 'X';
+	      }
+	  }
+	  else if (command == 'F')
+	  {
+	      if (new_cmd)
+	      {
+	    	  thetat = params[0];
+	    	  while (thetat >  (float)M_PI) thetat -= 2.0f * (float)M_PI;
+	    	  while (thetat < -(float)M_PI) thetat += 2.0f * (float)M_PI;
+	          new_cmd = 0;
+	      }
+	      else
+	      {
+		      float th;
+	    	  uint32_t primask = __get_PRIMASK();
+			  __disable_irq();
+			  th = robot_theta;
+			  __set_PRIMASK(primask);
+			  float theta_dif = th-thetat;
+			  if (theta_dif<0.0873f && theta_dif>-0.0873f)
+			  {
+				  set_M_speeds(STOP_SPEED, STOP_SPEED);
+				  motor_L = STOP_SPEED;
+				  motor_R = STOP_SPEED;
+				  command = 'X';
+			  }
+			  else if (theta_dif<-0.0873f)
+			  {
+				  motor_L = MAX_B_SPEED;
+				  motor_R = MAX_B_SPEED;
+			  }
+			  else
+			  {
+				  motor_L = MAX_F_SPEED;
+				  motor_R = MAX_F_SPEED;
+			  }
+			  set_M_speeds(motor_L, motor_R);
+	      }
+	  }
+	  else if (command == 'G')
+	  {
+	      if (new_cmd)
+	      {
+	    	  thetat = params[0];
+	    	  while (thetat >  (float)M_PI) thetat -= 2.0f * (float)M_PI;
+	    	  while (thetat < -(float)M_PI) thetat += 2.0f * (float)M_PI;
+	    	  distt = params[1];
+			  {
+				  uint32_t primask = __get_PRIMASK();
+				  __disable_irq();
+				  xt  = robot_x;
+				  yt = robot_y;
+				  __set_PRIMASK(primask);
+			  }
+	          new_cmd = 0;
+	      }
+	      else
+	      {
+	    	  float x, y, th;
+			  {
+				  uint32_t primask = __get_PRIMASK();
+				  __disable_irq();
+				  x  = robot_x;
+				  y  = robot_y;
+				  th = robot_theta;
+				  __set_PRIMASK(primask);
+			  }
+			  float theta_dif = th-thetat;
+			  if (theta_dif<0.0873f && theta_dif>-0.0873f)
+			  {
+				  float dists = dist_to_target(x,y,xt,yt);
+				  float dist_dif = dists - distt;
+				  if (dist_dif < -0.01f)
+				  {
+					  motor_L = MAX_F_SPEED;
+					  motor_R = MAX_B_SPEED;
+				  }
+				  else
+				  {
+					  motor_L = STOP_SPEED;
+					  motor_R = STOP_SPEED;
+					  set_M_speeds(motor_L, motor_R);
+					  command = 'X';
+				  }
+			  }
+			  else if (theta_dif<-0.0873f)
+			  {
+				  motor_L = MAX_B_SPEED;
+				  motor_R = MAX_B_SPEED;
+			  }
+			  else
+			  {
+				  motor_L = MAX_F_SPEED;
+				  motor_R = MAX_F_SPEED;
+			  }
+			  set_M_speeds(motor_L, motor_R);
+	      }
+	  }
+	  else if (command == 'Z')
+	  {
+	      if (new_cmd)
+	      {
+	          // params[0] = target_x (float, meters)
+	          // params[1] = target_y (float, meters)
+	    	  BF_grid_index = 0;
+	    	  xt = grid[BF_grid_index][0];
+	    	  yt = grid[BF_grid_index][1];
+	          goto_state = GOTO_ROTATE;   // start by rotating to face target
+	          new_cmd = 0;
+	      }
+
+	      // run one step each loop
+	      gotoXY();
+
+	      // when done, clear command
+	      if (goto_state == GOTO_DONE)
+	      {
+	    	  if (BF_grid_index >= 8)
+	    	  {
+		          goto_state = GOTO_IDLE;
+		          command = 'X';
+	    	  }
+	    	  else{
+	    		  xt = grid[BF_grid_index][0];
+				  yt = grid[BF_grid_index][1];
+				  BF_grid_index++;
+				  goto_state = GOTO_ROTATE;   // continue to next cell by rotating to face target
+	    	  }
+	      }
+	  }
+	}
+}
+
+// non-blocking step function; call frequently from main loop
+void gotoXY(void)
+{
+    // snapshot pose atomically (optional but consistent with your style)
+    float x, y, th;
+    {
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        x  = robot_x;
+        y  = robot_y;
+        th = robot_theta;
+        __set_PRIMASK(primask);
+    }
+
+    float d = dist_to_target(x, y, xt, yt);
+    float e = heading_error_to_target(x, y, th, xt, yt);  // + => need CW, - => need CCW (based on your convention)
+
+    // stop condition
+    if (d <= GOTO_DIST_OK_M)
+    {
+        set_M_speeds(STOP_SPEED, STOP_SPEED);
+        motor_L = STOP_SPEED;
+        motor_R = STOP_SPEED;
+        goto_state = GOTO_DONE;
+        return;
+    }
+
+    switch (goto_state)
+    {
+        case GOTO_ROTATE:
+        {
+            // if aligned enough -> start driving
+            if (fabsf(e) <= GOTO_THETA_OK_RAD)
+            {
+                motor_L = GOTO_FWD_L;
+                motor_R = GOTO_FWD_R;
+                set_M_speeds(motor_L, motor_R);
+                goto_state = GOTO_DRIVE;
+            }
+            else
+            {
+                // rotate towards target
+                if (e > 0.0f)
+                {
+                    motor_L = GOTO_ROT_CW_L;
+                    motor_R = GOTO_ROT_CW_R;
+                }
+                else
+                {
+                    motor_L = GOTO_ROT_CCW_L;
+                    motor_R = GOTO_ROT_CCW_R;
+                }
+                set_M_speeds(motor_L, motor_R);
+            }
+        } break;
+
+        case GOTO_DRIVE:
+        {
+            // while driving, if heading error grows too big -> stop and rotate again
+            if (fabsf(e) > GOTO_THETA_DRIVE_MAX_RAD)
+            {
+                set_M_speeds(STOP_SPEED, STOP_SPEED);
+                motor_L = STOP_SPEED;
+                motor_R = STOP_SPEED;
+                goto_state = GOTO_ROTATE;
+            }
+            else
+            {
+                // keep driving forward
+                motor_L = GOTO_FWD_L;
+                motor_R = GOTO_FWD_R;
+                set_M_speeds(motor_L, motor_R);
+            }
+        } break;
+
+        case GOTO_DONE:
+        default:
+            // do nothing
+            break;
+    }
+}
 // -------------------------------------------------------------------------------------
 
 /* USER CODE END 0 */
@@ -358,6 +970,7 @@ int main(void)
   MX_USART2_UART_Init();
   MX_ADC1_Init();
   MX_TIM9_Init();
+  MX_TIM10_Init();
   /* USER CODE BEGIN 2 */
   // PWM Timers for motors
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
@@ -374,142 +987,36 @@ int main(void)
   // set interrupt for USART1
   HAL_UART_Receive_IT(&huart1, &rxByte, 1);
 
+  // set timer interrupt for odom and cam pose poll
+  HAL_TIM_Base_Start_IT(&htim10);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  uint8_t rotating = 0;
   while (1)
   {
-	  if (command == 'W') // random move
-	  {
-		  state = 'R'; // move random
-		  last_tick = HAL_GetTick();
-	  }
-	  else if (command == 'F') // move forward for a duration
-	  {
-		  state = 'C'; // continue this command
-		  last_tick = HAL_GetTick();
-		  set_M_speeds(MAX_F_SPEED, MAX_B_SPEED); // F
-		  running_cmd = param1;
-	  }
-	  else if (command == 'R') // rotate CW
-	  {
-		  state = 'C'; // continue this command
-		  last_tick = HAL_GetTick();
-		  set_M_speeds(MAX_F_SPEED, MAX_F_SPEED); // CW
-		  running_cmd = param1;
-	  }
-	  else if (command == 'L') // rotate CW
-	  {
-		  state = 'C'; // continue this command
-		  last_tick = HAL_GetTick();
-		  set_M_speeds(MAX_B_SPEED, MAX_B_SPEED); // CCW
-		  running_cmd = param1;
-	  }
-	  else if (command == 'M') // rotate CW
-	  {
-		  state = 'M'; // move to param1,param2
-		  xt = param1 / 1000.0f;
-		  yt = param2 / 1000.0f;
-		  last_tick = HAL_GetTick();
-		  set_M_speeds(STOP_SPEED, STOP_SPEED); // stay for now
-		  running_cmd = param1;
-	  }
-	  else if (command == 'S') // stop
-	  {
-		  state = 'I'; // idle, do nothing
-		  set_M_speeds(STOP_SPEED, STOP_SPEED);
-	  }
-	  command = 'I';
+	  uint32_t odom_n = 0, cam_n = 0;
+	  uint32_t primask = __get_PRIMASK();
+	  __disable_irq();
+	  odom_n = odom_due;  odom_due = 0;
+	  cam_n  = cam_due;   cam_due  = 0;
+	  __set_PRIMASK(primask);
 
-	  if (state == 'R') // random move
-	  {
-		  // play around
-		  if(adc_readings[0] > 350 || adc_readings[1] > 350 || adc_readings[2] > 350)
-		  {
-			  if(rotating == 0)
-			  {
-				  rotating = 1;
-				  if(adc_readings[1] > adc_readings[2])
-					  set_M_speeds(MAX_B_SPEED, MAX_B_SPEED); // CCW
-				  else
-					  set_M_speeds(MAX_F_SPEED, MAX_F_SPEED); // CW
-			  }
-			  else
-			  {
-				  HAL_Delay(10);
-			  }
-		  }
-		  else
-		  {
-			  rotating = 0;
-			  set_M_speeds(MAX_F_SPEED, MAX_B_SPEED); // F
-			  HAL_Delay(10);
-		  }
+	  // if requested, update odometry
+	  if (odom_n>0) {
+	      update_odometry();
 	  }
-	  else if (state == 'C')
+	  // if requested, update from cam pose
+	  if (cam_n)
 	  {
-		  if (running_cmd <= (HAL_GetTick() - last_tick))
-			  command = 'S'; // stop
-	  }
-	  else if (state == 'M')
-	  {
-		  float dx=xt-robot_x, dy=yt-robot_y;
-		  float dist=sqrtf(dx*dx+dy*dy);
-		  if(dist<0.05){
-			  command = 'S'; // stop
-		  }
-		  float tyaw=atan2f(dy,dx);
-		  float err=tyaw-(robot_theta+M_PI/2.0f);
-		  while(err>M_PI)err-=2*M_PI;
-		  while(err<-M_PI)err+=2*M_PI;
-
-		  if(fabsf(err)>0.1){
-		    if(err>0)
-		    	set_M_speeds(MAX_B_SPEED,MAX_B_SPEED);
-		    else
-		    	set_M_speeds(MAX_F_SPEED,MAX_F_SPEED);
-		  }else{
-		    set_M_speeds(MAX_F_SPEED,MAX_B_SPEED);
-		  }
-		  // HAL_Delay(10);
+	      do_camera_correction();
 	  }
 
-	  // update odometry
-	  update_odometry();
-
-	  // handle serial communication if needed
-	  if (msgReady) {
-	      msgReady = 0;
-
-	      // Check if it's UPOSE command
-	      if (strncmp(rxBuffer, "UPOSE#", 6) == 0) {
-	          float new_x, new_y, new_theta;
-
-	          // Parse: "UPOSE#x#y#theta"
-	          if (sscanf(rxBuffer, "UPOSE#%f#%f#%f", &new_x, &new_y, &new_theta) == 3) {
-
-	              // Reply with CURRENT pose before updating
-	              char response[64];
-	              sprintf(response, "%.2f#%.2f#%.2f\n", robot_x, robot_y, robot_theta);
-	              HAL_UART_Transmit(&huart1, (uint8_t*)response, strlen(response), 100);
-
-	              // Now update robot memory with new values
-	              robot_x = new_x;
-	              robot_y = new_y;
-	              robot_theta = new_theta;
-	          }
-	      } else if (strncmp(rxBuffer, "GPOSE#", 6) == 0) {
-	    	  // Reply with CURRENT pose before updating
-			  char response[64];
-			  sprintf(response, "%.2f#%.2f#%.2f\n", robot_x, robot_y, robot_theta);
-			  HAL_UART_Transmit(&huart1, (uint8_t*)response, strlen(response), 100);
-	      } else if (strncmp(rxBuffer, "CMD#", 4) == 0) {
-	    	  // receive command
-	    	  sscanf(rxBuffer, "CMD#%c#%ld#%ld", &command, &param1, &param2);
-	      }
-	  }
+	  // handle commands
+	  parse_command_if_ready();
+	  // handle commands
+	  handle_command();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -669,7 +1176,7 @@ static void MX_TIM2_Init(void)
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 8399;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 4;
+  htim2.Init.Period = 99;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
@@ -871,6 +1378,37 @@ static void MX_TIM9_Init(void)
   /* USER CODE BEGIN TIM9_Init 2 */
 
   /* USER CODE END TIM9_Init 2 */
+
+}
+
+/**
+  * @brief TIM10 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM10_Init(void)
+{
+
+  /* USER CODE BEGIN TIM10_Init 0 */
+
+  /* USER CODE END TIM10_Init 0 */
+
+  /* USER CODE BEGIN TIM10_Init 1 */
+
+  /* USER CODE END TIM10_Init 1 */
+  htim10.Instance = TIM10;
+  htim10.Init.Prescaler = 8399;
+  htim10.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim10.Init.Period = 99;
+  htim10.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim10.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim10) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM10_Init 2 */
+
+  /* USER CODE END TIM10_Init 2 */
 
 }
 
