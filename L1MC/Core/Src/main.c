@@ -27,6 +27,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdint.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -74,7 +75,7 @@ volatile int16_t encoder_right_count = 0;
 volatile int16_t encoder_left_count = 0;
 
 // Distance sensors
-#define NUM_SAMPLES 16
+#define NUM_SAMPLES 15
 volatile uint16_t adc_buffer[NUM_SAMPLES];
 volatile uint16_t adc_readings_off[3];  // active DMUX channels are 0, 1 and 7 when IR LED is off
 volatile uint16_t adc_readings_on[3];  // active DMUX channels are 0, 1 and 7 when IR LED is on
@@ -91,26 +92,28 @@ const uint8_t dmux_channels[3] = {0, 1, 7}; // active DMUX channels
 
 // Serial communication with ESP8266
 uint8_t rxByte;
-char rxBuffer[64];
+char rxBuffer[256];
 uint8_t rxIndex = 0;
-volatile uint8_t poseReady = 0;
+volatile uint8_t posReady = 0;
+volatile uint8_t oposReady = 0;
 volatile uint8_t cmdReady  = 0;
-char poseBuffer[64];
-char cmdBuffer[64];
+char cmdBuffer[256];
+char posBuffer[256];
 
 
-// Robot geometry and pose (in meters and radians)
+// Robot geometry and pos (in meters and radians)
 // geometry
 #define WHEEL_RADIUS 0.0225f   // [m]  wheel radius (6 cm)
 #define WHEEL_BASE   0.14f   // [m]  distance between wheel centers
-// pose
+// pos
 float robot_x = 0.0f;
 float robot_y = 0.0f;
 float robot_theta = 0.0f;
-uint8_t invalid_pose = 1;
+uint8_t initial_pos = 1;
+volatile uint8_t broadcastPOS_due = 0; // flag to broadcast position
 volatile uint8_t odom_due = 0; // flag to request odom update
-volatile uint32_t cam_due  = 0; // flag for request cam pose update
-// cam pose
+volatile uint32_t cam_due  = 0; // flag for request cam pos update
+// cam pos
 #define POSE_LPF_ALPHA  0.8f
 #define POSE_WAIT_MS    1000u
 #define STOP_SETTLE_MS  150u
@@ -144,10 +147,100 @@ volatile goto_state_t goto_state = GOTO_IDLE;
 #define GOTO_FWD_L      (MAX_F_SPEED)
 #define GOTO_FWD_R      (MAX_B_SPEED)
 
-// goto xy
+// goto xy and SCE algorithm variables
+#define CELL   0.15f
+#define X0     0.15f
+#define Y0     0.15f
+#define COLS   11
+#define ROWS   4
+
+#define INVALID_POSE -1000.0f
+
+#define MAX_VISIT_AND_PENALTY_COUNT 1000.0f
+
 float xt,yt,thetat,distt;
-float grid[8][2] = {{0.3f,0.15f},{1.65f,0.15f},{1.65f,0.3f},{0.15f,0.3f},{0.15f,0.45f},{1.65f,0.45f},{1.65f,0.6f},{0.15f,0.6f}};
-uint8_t BF_grid_index;
+int xt_i, yt_i; // indices of the target cell
+float visits_map[ROWS][COLS] = {0};
+float penalties_map[ROWS][COLS] = {0};
+
+
+// inter swarm communication
+#define MID 15
+#define MAX_OTHER_ROBOTS 4   // max others when total robots=5
+// posBuffer is used also as oposBuffer
+float other_robots[MAX_OTHER_ROBOTS][2];
+#define INVALID_MID 222
+uint8_t other_robots_ids[MAX_OTHER_ROBOTS] = {0};
+uint8_t n_other_robots = 0;
+
+// recovery window for broadcasts
+#define REC_WINDOW 5
+
+static int16_t rec_cells[REC_WINDOW][2];  // [i][0]=r, [i][1]=c
+static uint8_t rec_head = 0;
+
+static void rec_init(void)
+{
+    for (int i = 0; i < REC_WINDOW; i++) {
+        rec_cells[i][0] = -1;
+        rec_cells[i][1] = -1;
+    }
+    rec_head = 0;
+}
+
+static void rec_push_cell(int r, int c)
+{
+    rec_cells[rec_head][0] = (int16_t)r;
+    rec_cells[rec_head][1] = (int16_t)c;
+
+    rec_head++;
+    if (rec_head >= REC_WINDOW) rec_head = 0;
+}
+
+static inline int round_nearest(float v)
+{
+    return (v >= 0.0f) ? (int)(v + 0.5f) : (int)(v - 0.5f);
+}
+void penalize_target_cell()
+{
+	if (penalties_map[yt_i][xt_i] < MAX_VISIT_AND_PENALTY_COUNT)
+		penalties_map[yt_i][xt_i] += 1;
+}
+void discount_penalties()
+{
+	for (uint32_t i = 0; i < ROWS; i++) {
+	    for (uint32_t j = 0; j < COLS; j++) {
+	        penalties_map[i][j] *= 0.5f;
+	    }
+	}
+}
+void visits_map_update(float x, float y)
+{
+    int c = round_nearest((x - X0) / CELL);
+    int r = round_nearest((y - Y0) / CELL);
+
+    /* clamp to valid grid */
+    if (c < 0) c = 0;
+    if (c >= COLS) c = COLS - 1;
+
+    if (r < 0) r = 0;
+    if (r >= ROWS) r = ROWS - 1;
+
+    if (visits_map[r][c] == 0)
+    {
+    	discount_penalties();
+    	// update recovey window
+    	rec_push_cell(r, c);
+    }
+    if (visits_map[r][c] < MAX_VISIT_AND_PENALTY_COUNT)
+    	visits_map[r][c] += 1.0f;
+}
+float fpow_simple(float base, unsigned exp)
+{
+    float r = 1.0f;
+    while (exp--) r *= base;
+    return r;
+}
 
 /* USER CODE END PV */
 
@@ -241,10 +334,16 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     	odom_due++;
 
     	static uint16_t div200 = 0;
-		if (++div200 >= 200) {     // 2 seconds @ 100 Hz
-			div200 = 0;
-			cam_due++;
-		}
+      if (++div200 >= 200) {     // 2 seconds @ 100 Hz
+        div200 = 0;
+        cam_due++;
+      }
+
+      static uint16_t div300 = 0;
+      if (++div300 >= 300) {     // 3 seconds @ 100 Hz
+        div300 = 0;
+        broadcastPOS_due = 1;
+      }
     }
 }
 // Odometry calculations
@@ -273,7 +372,7 @@ void update_odometry(void) {
     float delta_s = (distance_right + distance_left) / 2.0f;
     float delta_theta = (distance_right - distance_left) / WHEEL_BASE;
 
-    // Update robot pose
+    // Update robot pos
     robot_x += delta_s * cosf(robot_theta + delta_theta / 2.0f + M_PI / 2.0f);
     robot_y += delta_s * sinf(robot_theta + delta_theta / 2.0f + M_PI / 2.0f);
     robot_theta += delta_theta;
@@ -284,22 +383,22 @@ void update_odometry(void) {
     else if (robot_theta < -M_PI)
         robot_theta += 2.0f * M_PI;
 }
-// cam pose
-static int parse_pose_reply(const char *s, float *x, float *y, float *th)
+// cam pos
+static int parse_pos_reply(const char *s, float *x, float *y, float *th)
 {
     // very strict format; returns 1 on success
     // "POSE %f %f %f"
     return (sscanf(s, "POS#%f#%f#%f", x, y, th) == 3) ? 1 : 0;
 }
-static void lpf_update_pose(float x_meas, float y_meas, float th_meas)
+static void lpf_update_pos(float x_meas, float y_meas, float th_meas)
 {
-	// onlt the very first cam pose must be used as an absoloute update (reset state)
-	if (invalid_pose)
+	// onlt the very first cam pos must be used as an absoloute update (reset state)
+	if (initial_pos)
 	{
 		robot_x = x_meas;
 		robot_y = y_meas;
 		robot_theta = th_meas;
-		invalid_pose = 0;
+		initial_pos = 0;
 	}
 	else
 	{
@@ -321,7 +420,7 @@ static void lpf_update_pose(float x_meas, float y_meas, float th_meas)
 }
 void do_camera_correction(void)
 {
-	// if command P as active, then don't poll cam pose, because of Serial conflicts
+	// if command P as active, then don't poll cam pos, because of Serial conflicts
 	if (command == 'P')
 		return;
 
@@ -333,7 +432,7 @@ void do_camera_correction(void)
     // 3) let mechanics settle
     HAL_Delay(STOP_SETTLE_MS);
 
-    // 4) request pose from ESP (serial)
+    // 4) request pos from ESP (serial)
     const char req[] = "POSE?\n";
     (void)HAL_UART_Transmit(&huart1, (uint8_t*)req, (uint16_t)(sizeof(req) - 1), 50);
 
@@ -342,31 +441,31 @@ void do_camera_correction(void)
     {
         uint32_t primask = __get_PRIMASK();
         __disable_irq();
-        poseReady = 0;
-        poseBuffer[0] = '\0';
+        posReady = 0;
+        posBuffer[0] = '\0';
         __set_PRIMASK(primask);
     }
 
     uint32_t t0 = HAL_GetTick();
     while ((HAL_GetTick() - t0) < POSE_WAIT_MS)
     {
-        if (poseReady)
+        if (posReady)
         {
-            char local[64];
+            char local[256];
 
             // copy buffer atomically and clear flag
             uint32_t primask = __get_PRIMASK();
             __disable_irq();
-            poseReady = 0;
-            strncpy(local, poseBuffer, sizeof(local));
+            posReady = 0;
+            strncpy(local, posBuffer, sizeof(local));
             local[sizeof(local) - 1] = '\0';
             __set_PRIMASK(primask);
 
             float x_meas, y_meas, th_meas;
-            if (parse_pose_reply(local, &x_meas, &y_meas, &th_meas))
+            if (parse_pos_reply(local, &x_meas, &y_meas, &th_meas))
             {
-                // 6) update pose with LPF
-                lpf_update_pose(x_meas, y_meas, th_meas);
+                // 6) update pos with LPF
+                lpf_update_pos(x_meas, y_meas, th_meas);
             }
             break; // either parsed or ignored; in both cases stop waiting
         }
@@ -420,7 +519,10 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
             adc_readings_on[current_dmux_index] = (uint16_t)miliVolts;
 
             // Calculate difference
-            adc_readings[current_dmux_index] = adc_readings_on[current_dmux_index] - adc_readings_off[current_dmux_index];
+            if (adc_readings_off[current_dmux_index] < adc_readings_on[current_dmux_index])
+            	adc_readings[current_dmux_index] = adc_readings_on[current_dmux_index] - adc_readings_off[current_dmux_index];
+            else
+            	adc_readings[current_dmux_index] = 0; // invalid reading
 
             current_step = 0;
 
@@ -443,7 +545,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
         HAL_TIM_Base_Start_IT(&htim9);     // Start timer with interrupt
     }
 }
-
 // ------------------------------------------------------------ Serial connection to the Wifi cheap
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 	if (huart == &huart1)
@@ -466,17 +567,22 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 			}
 			else if (strncmp(rxBuffer, "POS#", 4) == 0)
 			{
-				if (!poseReady)
+				if (!posReady)
 				{
-					strncpy(poseBuffer, rxBuffer, sizeof(poseBuffer));
-					poseBuffer[sizeof(poseBuffer) - 1] = '\0';
-					poseReady = 1;
+					strncpy(posBuffer, rxBuffer, sizeof(posBuffer));
+					posBuffer[sizeof(posBuffer) - 1] = '\0';
+					posReady = 1;
 				}
 			}
-			else
-			{
-				// drop it
-			}
+            else if (strncmp(rxBuffer, "OPOS#", 5) == 0)
+            {
+                if (!oposReady)
+                {
+                    strncpy(posBuffer, rxBuffer, sizeof(posBuffer));
+                    posBuffer[sizeof(posBuffer) - 1] = '\0';
+                    oposReady = 1;
+                }
+            }
 			rxIndex = 0;
 		}
 		else if (rxIndex < (sizeof(rxBuffer) - 1))
@@ -585,6 +691,123 @@ static float dist_to_target(float x, float y, float tx, float ty)
     float dy = ty - y;
     return sqrtf(dx*dx + dy*dy);
 }
+
+static inline int obstacle_in_front()
+{
+    uint16_t s0, s1, s2;
+
+    // atomic snapshot
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    s0 = adc_readings[0];   // front
+    s1 = adc_readings[1];   // front-right
+    s2 = adc_readings[2];   // front-left
+    __set_PRIMASK(primask);
+
+    // no obstacle
+    if (s0 <= 900 && s1 <= 1200 && s2 <= 1200) {
+        return 0;
+    }
+
+    // any obstacle detected
+    return 1;
+}
+
+// non-blocking step function; call frequently from main loop
+void gotoXY()
+{
+    // snapshot pos atomically
+    float x, y, th;
+    {
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        x  = robot_x;
+        y  = robot_y;
+        th = robot_theta;
+        __set_PRIMASK(primask);
+    }
+
+    float d = dist_to_target(x, y, xt, yt);
+    float e = heading_error_to_target(x, y, th, xt, yt);  // + => need CW, - => need CCW
+
+    // stop condition
+    if (d <= GOTO_DIST_OK_M)
+    {
+        set_M_speeds(STOP_SPEED, STOP_SPEED);
+        motor_L = STOP_SPEED;
+        motor_R = STOP_SPEED;
+        goto_state = GOTO_DONE;
+        return;
+    }
+
+    switch (goto_state)
+    {
+        case GOTO_ROTATE:
+        {
+            // if aligned enough -> start driving
+            if (fabsf(e) <= GOTO_THETA_OK_RAD)
+            {
+                motor_L = GOTO_FWD_L;
+                motor_R = GOTO_FWD_R;
+                set_M_speeds(motor_L, motor_R);
+                goto_state = GOTO_DRIVE;
+            }
+            else
+            {
+                // rotate towards target
+                if (e > 0.0f)
+                {
+                    motor_L = GOTO_ROT_CW_L;
+                    motor_R = GOTO_ROT_CW_R;
+                }
+                else
+                {
+                    motor_L = GOTO_ROT_CCW_L;
+                    motor_R = GOTO_ROT_CCW_R;
+                }
+                set_M_speeds(motor_L, motor_R);
+            }
+        } break;
+
+        case GOTO_DRIVE:
+        {
+        	/* before moving check if there is an obstacle in front,
+        	 * in this case, stop moving and penalize the cell,
+        	 * also set state to GOTO_DONE to invalidate the current best_cell
+        	 */
+        	int any_obstacle = obstacle_in_front();
+        	if (any_obstacle==1)
+        	{
+        		penalize_target_cell();
+                set_M_speeds(STOP_SPEED, STOP_SPEED);
+                motor_L = STOP_SPEED;
+                motor_R = STOP_SPEED;
+        		goto_state = GOTO_DONE;
+        	}
+            // while driving, if heading error grows too big -> stop and rotate again
+        	else if (fabsf(e) > GOTO_THETA_DRIVE_MAX_RAD)
+            {
+                set_M_speeds(STOP_SPEED, STOP_SPEED);
+                motor_L = STOP_SPEED;
+                motor_R = STOP_SPEED;
+                goto_state = GOTO_ROTATE;
+            }
+            else
+            {
+                // keep driving forward
+                motor_L = GOTO_FWD_L;
+                motor_R = GOTO_FWD_R;
+                set_M_speeds(motor_L, motor_R);
+            }
+        } break;
+
+        case GOTO_DONE:
+        default:
+            // do nothing
+            break;
+    }
+}
+
 void handle_command(void)
 {
 	if (command != 'X')
@@ -670,7 +893,7 @@ void handle_command(void)
 	      char tx[64];
 	      int len;
 
-	      // snapshot pose atomically
+	      // snapshot pos atomically
 	      float x, y, th;
 	      {
 	          uint32_t primask = __get_PRIMASK();
@@ -811,121 +1034,250 @@ void handle_command(void)
 			  set_M_speeds(motor_L, motor_R);
 	      }
 	  }
-	  else if (command == 'Z')
+	  else if (command == 'Q')
 	  {
 	      if (new_cmd)
 	      {
-	          // params[0] = target_x (float, meters)
-	          // params[1] = target_y (float, meters)
-	    	  BF_grid_index = 0;
-	    	  xt = grid[BF_grid_index][0];
-	    	  yt = grid[BF_grid_index][1];
-	          goto_state = GOTO_ROTATE;   // start by rotating to face target
+	    	  visits_map[0][0] = 100; // mark table marker place az visited
+	    	  goto_state = GOTO_DONE;   // start by rotating to face target
 	          new_cmd = 0;
+	      }
+		  // mark current place as visited for this robot and other known robots
+		  uint32_t primask = __get_PRIMASK();
+		  float x,y;
+		  __disable_irq();
+		  x = robot_x;
+		  y = robot_y;
+		  __set_PRIMASK(primask);
+		  visits_map_update(x, y);
+		  for (int i = 0; i < n_other_robots; i++)
+		  {
+			  visits_map_update(other_robots[i][0], other_robots[i][1]);
+		  }
+
+	      if (goto_state == GOTO_DONE)
+	      {
+			  // find the next best cell to go
+			  float best_x, best_y;
+			  int closer_bots_f = 0;
+			  float fittest = -1;
+			  float Ar, D, Dbar,fitness,dist,cx,cy;
+			  uint8_t unvisited = 0;
+			  for (int r = 0; r < 4; r++)
+			  {
+				  for (int c = 0; c < 11; c++)
+				  {
+					if (visits_map[r][c] < 1)
+					  unvisited += 1;
+					Ar = fpow_simple(visits_map[r][c] + penalties_map[r][c] + 1, 10);
+					cx = c * 0.15f + 0.15f;
+					cy = r * 0.15f + 0.15f;
+					dist = dist_to_target(x, y, cx, cy);
+					D = fpow_simple(dist, 2);
+					Dbar = 1;
+				    int closer_bots = 0;
+					for (int i = 0; i < n_other_robots; i++)
+					{
+						float dist_to_other_robot = dist_to_target(other_robots[i][0], other_robots[i][1], cx, cy);
+						Dbar += dist_to_other_robot;
+						if (dist_to_other_robot < dist)
+							closer_bots++;
+					}
+					Dbar = fpow_simple(Dbar, 2);
+					fitness = Dbar / (Ar*D);
+					if (fitness>fittest && dist>=0.075f) //TODO: 0.075 is half cell size
+					{
+						  fittest = fitness;
+						  closer_bots_f = closer_bots;
+						  best_x = cx;
+						  best_y = cy;
+						  xt_i = c;
+						  yt_i = r;
+					}
+				  }
+			  }
+
+			  // if number of unvisited cells are less than the number of robots, robots should avoid moving if they are not the closest bot to the unvisited cells
+			  if (unvisited < (n_other_robots+1) && closer_bots_f>0)
+				  fittest = -1;
+			  // fitness maybe -1 (no cell celected)
+			  if (fittest > 0)
+			  {
+				xt = best_x;
+				yt = best_y;
+				motor_L = STOP_SPEED;
+				motor_R = STOP_SPEED;
+				set_M_speeds(motor_L, motor_R);
+				goto_state = GOTO_ROTATE;
+			  }
+
+		      // when done, clear command
+		      if (unvisited == 0)
+		      {
+		          goto_state = GOTO_IDLE;
+		          command = 'X';
+		      }
 	      }
 
 	      // run one step each loop
 	      gotoXY();
-
-	      // when done, clear command
-	      if (goto_state == GOTO_DONE)
-	      {
-	    	  if (BF_grid_index >= 8)
-	    	  {
-		          goto_state = GOTO_IDLE;
-		          command = 'X';
-	    	  }
-	    	  else{
-	    		  xt = grid[BF_grid_index][0];
-				  yt = grid[BF_grid_index][1];
-				  BF_grid_index++;
-				  goto_state = GOTO_ROTATE;   // continue to next cell by rotating to face target
-	    	  }
-	      }
 	  }
 	}
 }
 
-// non-blocking step function; call frequently from main loop
-void gotoXY(void)
+void handle_opos_if_ready(void)
 {
-    // snapshot pose atomically (optional but consistent with your style)
-    float x, y, th;
+    if (!oposReady) return;
+
+    char local[256];
+
     {
         uint32_t primask = __get_PRIMASK();
         __disable_irq();
-        x  = robot_x;
-        y  = robot_y;
-        th = robot_theta;
+        oposReady = 0;
+        strncpy(local, posBuffer, sizeof(local));
+        local[sizeof(local) - 1] = '\0';
         __set_PRIMASK(primask);
     }
 
-    float d = dist_to_target(x, y, xt, yt);
-    float e = heading_error_to_target(x, y, th, xt, yt);  // + => need CW, - => need CCW (based on your convention)
+    // Expect: OPOS#id#x#y#[r#c]...
+    // Tokenize by '#'
+    char *save = NULL;
+    char *tok = strtok_r(local, "#", &save);
+    if (!tok || strcmp(tok, "OPOS") != 0) return;
 
-    // stop condition
-    if (d <= GOTO_DIST_OK_M)
+    tok = strtok_r(NULL, "#", &save); if (!tok) return;
+    int id = atoi(tok);
+
+    tok = strtok_r(NULL, "#", &save); if (!tok) return;
+    float ox = (float)atof(tok);
+
+    tok = strtok_r(NULL, "#", &save); if (!tok) return;
+    float oy = (float)atof(tok);
+
+    // update other_robots list (same as your logic)
+    int found = 0;
+    for (int i = 0; i < n_other_robots; i++) {
+        if (other_robots_ids[i] == id) {
+            other_robots[i][0] = ox;
+            other_robots[i][1] = oy;
+            found = 1;
+            break;
+        }
+    }
+    if (!found && n_other_robots < MAX_OTHER_ROBOTS) {
+        other_robots_ids[n_other_robots] = id;
+        other_robots[n_other_robots][0] = ox;
+        other_robots[n_other_robots][1] = oy;
+        n_other_robots++;
+    }
+
+    // Parse remaining tokens as (r,c) pairs
+    while (1) {
+        char *tr = strtok_r(NULL, "#", &save);
+        if (!tr) break;
+        char *tc = strtok_r(NULL, "#", &save);
+        if (!tc) break;
+
+        int r = atoi(tr);
+        int c = atoi(tc);
+        if (r < 0 || r >= ROWS) continue;
+        if (c < 0 || c >= COLS) continue;
+        // do the update directlt here
+        if (visits_map[r][c] < MAX_VISIT_AND_PENALTY_COUNT)
+                visits_map[r][c] += 1.0f;
+    }
+}
+void broadcast_pos(void)
+{
+    char tx[256];
+    int len = 0;
+
+    // atomic snapshot of pose (if you still want x,y for "current position" use)
+    float x, y;
     {
-        set_M_speeds(STOP_SPEED, STOP_SPEED);
-        motor_L = STOP_SPEED;
-        motor_R = STOP_SPEED;
-        goto_state = GOTO_DONE;
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        x = robot_x;
+        y = robot_y;
+        __set_PRIMASK(primask);
+    }
+
+    // atomic snapshot of recovery cells
+    int16_t snap[REC_WINDOW][2];
+    {
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        for (int i = 0; i < REC_WINDOW; i++) {
+            snap[i][0] = rec_cells[i][0];
+            snap[i][1] = rec_cells[i][1];
+        }
+        __set_PRIMASK(primask);
+    }
+
+    // base
+    len = snprintf(tx, sizeof(tx), "BPOS#%d#%.3f#%.3f", MID, x, y);
+    if (len < 0 || len >= (int)sizeof(tx)) return;
+
+    // order is not important
+    for (int k = 0; k < REC_WINDOW; k++) {
+        int r = snap[k][0];
+        int c = snap[k][1];
+        if (r < 0 || c < 0)
+        	break; // skip the rest, this will happen only at the beginning that the window is not full
+
+        int n = snprintf(tx + len, sizeof(tx) - (size_t)len, "#%d#%d", r, c);
+        if (n < 0 || n >= (int)(sizeof(tx) - (size_t)len)) break;
+        len += n;
+    }
+
+    // newline
+    if (len < (int)sizeof(tx) - 2) {
+        tx[len++] = '\n';
+        tx[len] = '\0';
+    } else {
         return;
     }
 
-    switch (goto_state)
-    {
-        case GOTO_ROTATE:
-        {
-            // if aligned enough -> start driving
-            if (fabsf(e) <= GOTO_THETA_OK_RAD)
-            {
-                motor_L = GOTO_FWD_L;
-                motor_R = GOTO_FWD_R;
-                set_M_speeds(motor_L, motor_R);
-                goto_state = GOTO_DRIVE;
-            }
-            else
-            {
-                // rotate towards target
-                if (e > 0.0f)
-                {
-                    motor_L = GOTO_ROT_CW_L;
-                    motor_R = GOTO_ROT_CW_R;
-                }
-                else
-                {
-                    motor_L = GOTO_ROT_CCW_L;
-                    motor_R = GOTO_ROT_CCW_R;
-                }
-                set_M_speeds(motor_L, motor_R);
-            }
-        } break;
+    HAL_UART_Transmit(&huart1, (uint8_t*)tx, (uint16_t)len, 50);
+}
 
-        case GOTO_DRIVE:
-        {
-            // while driving, if heading error grows too big -> stop and rotate again
-            if (fabsf(e) > GOTO_THETA_DRIVE_MAX_RAD)
-            {
-                set_M_speeds(STOP_SPEED, STOP_SPEED);
-                motor_L = STOP_SPEED;
-                motor_R = STOP_SPEED;
-                goto_state = GOTO_ROTATE;
-            }
-            else
-            {
-                // keep driving forward
-                motor_L = GOTO_FWD_L;
-                motor_R = GOTO_FWD_R;
-                set_M_speeds(motor_L, motor_R);
-            }
-        } break;
+static inline int compute_avoid_rotation(int *rot_dir)
+{
+    // rot_dir: -1 = rotate right, +1 = rotate left, 0 = none
 
-        case GOTO_DONE:
-        default:
-            // do nothing
-            break;
+    uint16_t s0, s1, s2;
+
+    // atomic snapshot
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    s0 = adc_readings[0];   // front
+    s1 = adc_readings[1];   // front-right
+    s2 = adc_readings[2];   // front-left
+    __set_PRIMASK(primask);
+
+    if (s0 <= 600 && s1 <= 1000 && s2 <= 1000) {
+        *rot_dir = 0;
+        return 0;
     }
+
+    if (s0 > 500) {
+        *rot_dir = (s1 > s2) ? +1 : -1;
+        return 1;
+    }
+
+    if (s1 > 500) {
+        *rot_dir = +1;   // rotate left
+        return 1;
+    }
+
+    if (s2 > 500) {
+        *rot_dir = -1;   // rotate right
+        return 1;
+    }
+
+    *rot_dir = 0;
+    return 0;
 }
 // -------------------------------------------------------------------------------------
 
@@ -987,8 +1339,10 @@ int main(void)
   // set interrupt for USART1
   HAL_UART_Receive_IT(&huart1, &rxByte, 1);
 
-  // set timer interrupt for odom and cam pose poll
+  // set timer interrupt for odom and cam pos poll
   HAL_TIM_Base_Start_IT(&htim10);
+
+  rec_init(); // init recovery window for broadcasts
 
   /* USER CODE END 2 */
 
@@ -996,27 +1350,66 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  uint32_t odom_n = 0, cam_n = 0;
+	  uint32_t odom_n = 0, cam_n = 0, broadcastPOS_n = 0;
 	  uint32_t primask = __get_PRIMASK();
 	  __disable_irq();
 	  odom_n = odom_due;  odom_due = 0;
 	  cam_n  = cam_due;   cam_due  = 0;
+	  broadcastPOS_n = broadcastPOS_due; broadcastPOS_due = 0;
 	  __set_PRIMASK(primask);
 
 	  // if requested, update odometry
 	  if (odom_n>0) {
 	      update_odometry();
 	  }
-	  // if requested, update from cam pose
+	  // if requested, update from cam pos
 	  if (cam_n)
 	  {
 	      do_camera_correction();
 	  }
+    // if due time, broadcast pos to wifi module
+    if (broadcastPOS_n)
+    {
+        broadcast_pos();
+    }
 
-	  // handle commands
+	  // receive and parse commands
 	  parse_command_if_ready();
-	  // handle commands
-	  handle_command();
+
+    // handle other robots pos if available
+    handle_opos_if_ready();
+
+	// handle commands
+    /*int rot_dir;
+
+    if (compute_avoid_rotation(&rot_dir))
+    {
+        if (rot_dir > 0)
+        {
+            // rotate left
+            motor_L = MAX_B_SPEED;
+            motor_R = MAX_B_SPEED;
+        }
+        else
+        {
+            // rotate right
+            motor_L = MAX_F_SPEED;
+            motor_R = MAX_F_SPEED;
+        }
+
+        set_M_speeds(motor_L, motor_R);
+
+        HAL_Delay(5);
+        motor_L = STOP_SPEED;
+        motor_R = STOP_SPEED;
+        set_M_speeds(motor_L, motor_R);
+    }
+    else
+    {
+        handle_command();
+    }*/
+    // TODO: SOLAVE obstacle avoidance problem
+    handle_command();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

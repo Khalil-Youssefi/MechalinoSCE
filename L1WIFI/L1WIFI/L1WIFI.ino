@@ -15,6 +15,17 @@ const uint16_t POSE_PORT = 9000;
 WiFiClient poseClient;
 String serialBuf;
 
+// UDP for Inter-swarm connection
+#include <WiFiUdp.h>
+
+#define UDP_PORT 4242
+#define UDP_TX_PERIOD_MS 200   // 5 Hz
+
+WiFiUDP udp;
+
+static unsigned long udp_last_tx = 0;
+static char udp_rx_buf[256];
+
 static void ensurePoseClientConnected() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (poseClient.connected()) return;
@@ -23,29 +34,22 @@ static void ensurePoseClientConnected() {
   poseClient.setNoDelay(true);
   poseClient.setTimeout(1);
 
-  if (!poseClient.connect(laptopIP, POSE_PORT)) {
-    // Connection failed; leave it disconnected and try again later
+  bool ok = false;
+  for (int k = 0; k < 5; k++) {
+    if (poseClient.connect(laptopIP, POSE_PORT)) { ok = true; break; }
     poseClient.stop();
+    delay(10);
+    yield();
   }
 }
 
 static uint8_t requestPoseFromROS(float &x, float &y, float &yaw) {
   if (WiFi.status() != WL_CONNECTED) return 1;   // no WiFi
 
-  WiFiClient c;
-  c.setNoDelay(true);
-  c.setTimeout(2);
+  ensurePoseClientConnected();
+  if (!poseClient.connected()) return 2;
 
-  bool ok = false;
-  for (int k = 0; k < 5; k++) {
-    if (c.connect(laptopIP, POSE_PORT)) { ok = true; break; }
-    c.stop();
-    delay(10);
-    yield();
-  }
-  if (!ok) return 2; // connect fail
-
-  if (c.print("POSE\n") == 0) { c.stop(); return 3; } // write fail
+  if (poseClient.print("POSE\n") == 0) { poseClient.stop(); return 3; } // write fail
 
   char buf[96];
   size_t idx = 0;
@@ -53,13 +57,12 @@ static uint8_t requestPoseFromROS(float &x, float &y, float &yaw) {
   const uint32_t deadline_ms = 500; // increase for real WiFi jitter
 
   while ((millis() - t0) < deadline_ms) {
-    while (c.available() > 0) {
-      char ch = (char)c.read();
+    while (poseClient.available() > 0) {
+      char ch = (char)poseClient.read();
       if (ch == '\r') continue;
 
       if (ch == '\n') {
         buf[idx] = 0;
-        c.stop();
 
         // Accept both space and comma separated (just in case)
         for (size_t i = 0; buf[i]; i++) if (buf[i] == ',') buf[i] = ' ';
@@ -73,12 +76,11 @@ static uint8_t requestPoseFromROS(float &x, float &y, float &yaw) {
       }
 
       if (idx < sizeof(buf) - 1) buf[idx++] = ch;
-      else { c.stop(); return 6; } // line too long
+      else { return 6; } // line too long
     }
     delay(1);
   }
 
-  c.stop();
   return 4; // timeout waiting for newline
 }
 
@@ -177,8 +179,10 @@ void setup() {
   server.on("/cmd", HTTP_GET, handleCMD);
   server.begin();
   delay(100);
-  serialBuf.reserve(64);
+  serialBuf.reserve(256);
   ensurePoseClientConnected();
+
+  udp.begin(UDP_PORT);
 }
 
 void loop() {
@@ -186,6 +190,7 @@ void loop() {
   
   ensurePoseClientConnected();
 
+  static uint32_t last_yield = 0;
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
     if (c == '\r') continue;
@@ -202,11 +207,41 @@ void loop() {
           Serial.print("\n");
         }
       }
+      else if (serialBuf.startsWith("BPOS#")) {
+        // Broadcast everything after "BPOSE#"
+        const char *payload = serialBuf.c_str() + 5; // skip "BPOS#"
+
+        udp.beginPacket(IPAddress(255,255,255,255), UDP_PORT);
+        udp.write((const uint8_t*)payload, strlen(payload));
+        udp.endPacket();
+      }
       serialBuf = "";
     } else {
       serialBuf += c;
-      if (serialBuf.length() > 80) serialBuf = "";
+      if (serialBuf.length() > 240) serialBuf = "";
     }
+    
+    if ((millis() - last_yield) > 5) {  // every ~5 ms
+      last_yield = millis();
+      yield();
+    }
+  }
+
+  /* ---------- UDP RX ---------- */
+  static uint32_t last_opos_fwd = 0;
+  int pkt_len = udp.parsePacket();
+  if (pkt_len > 0) {
+      if (pkt_len >= (int)sizeof(udp_rx_buf))
+          pkt_len = sizeof(udp_rx_buf) - 1;
+
+      udp.read(udp_rx_buf, pkt_len);
+      udp_rx_buf[pkt_len] = '\0';
+
+      if (millis() - last_opos_fwd > 500) { // max 2 Hz forwarding
+        last_opos_fwd = millis();
+        Serial.print("OPOS#");
+        Serial.println(udp_rx_buf);
+      }
   }
   yield();
 }
