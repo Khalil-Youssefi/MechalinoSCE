@@ -27,9 +27,6 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <math.h>
-#include "robot_config.h"
-#include "motor.h"
-#include "gotoxy.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -52,7 +49,7 @@ typedef enum {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// Motors
+// Motors PWM values for forward/backward rotation at maximum speed
 #define MOTOR_PWM_STOP 1500
 #define MOTOR_PWM_MAX_FORWARD 1300
 #define MOTOR_PWM_MAX_BACKWARD 1700
@@ -68,6 +65,11 @@ typedef enum {
 #define ENCODER_RES 20
 
 // Distance sensors
+// Sensors direction relative to robot forward direction
+#define S0_OFF_RAD  (0.0f)
+#define S1_OFF_RAD  (DEG2RAD(+45.0f))                             // s1 is +45 deg
+#define S2_OFF_RAD  (DEG2RAD(-45.0f))                             // s2 is -45 deg
+
 #define IRD_NUM_SAMPLES 15
 
 // DMUX control pins
@@ -110,7 +112,7 @@ typedef enum {
 // recovery window for broadcasts
 #define REC_WINDOW 5
 
-// obstacle avoidance
+// obstacle avoidance params
 #define OBSTACLE_DIST_M       0.17f
 #define OBSTACLE_MARK_R       0.075f
 
@@ -119,11 +121,6 @@ typedef enum {
 #define OBSTACLE_TH2_MV       1200u                               // front-left
 
 #define DEG2RAD(x) ((x) * (float)M_PI / 180.0f)
-
-// Sensors direction relative to robot forward direction
-#define S0_OFF_RAD  (0.0f)
-#define S1_OFF_RAD  (DEG2RAD(+45.0f))                             // s1 is +45 deg
-#define S2_OFF_RAD  (DEG2RAD(-45.0f))                             // s2 is -45 deg
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -1919,3 +1916,4 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
+
