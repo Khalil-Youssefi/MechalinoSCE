@@ -165,7 +165,7 @@ float penalties_map[ROWS][COLS] = {0};
 
 
 // inter swarm communication
-#define MID 15
+#define MID 16
 #define MAX_OTHER_ROBOTS 4   // max others when total robots=5
 // posBuffer is used also as oposBuffer
 float other_robots[MAX_OTHER_ROBOTS][2];
@@ -240,6 +240,97 @@ float fpow_simple(float base, unsigned exp)
     float r = 1.0f;
     while (exp--) r *= base;
     return r;
+}
+
+// --- obstacle projection + marking visited cells ---
+#define OBSTACLE_DIST_M       0.17f
+#define OBSTACLE_MARK_R       0.075f
+
+#define OBSTACLE_TH0_MV       900u   // front
+#define OBSTACLE_TH1_MV       1200u  // front-right (use your current threshold or set your own)
+#define OBSTACLE_TH2_MV       1200u  // front-left  (use your current threshold or set your own)
+
+#define DEG2RAD(x) ((x) * (float)M_PI / 180.0f)
+
+// Sensor bearing offsets relative to robot forward direction
+#define S0_OFF_RAD  (0.0f)
+#define S1_OFF_RAD  (DEG2RAD(+45.0f))   // s1 is +45°
+#define S2_OFF_RAD  (DEG2RAD(-45.0f))   // s2 is -45°
+
+static inline void unit_vec_from_theta(float th, float off, float *ux, float *uy)
+{
+    // Your robot forward is (theta + pi/2). Add sensor offset around that.
+    float a = th + (float)M_PI_2 + off;
+    *ux = cosf(a);
+    *uy = sinf(a);
+}
+
+static inline void obstacle_pos_from_pose_and_offset(float x, float y, float th,
+                                                     float dist_m, float off_rad,
+                                                     float *ox, float *oy)
+{
+    float ux, uy;
+    unit_vec_from_theta(th, off_rad, &ux, &uy);
+    *ox = x + dist_m * ux;
+    *oy = y + dist_m * uy;
+}
+
+static void visits_map_mark_radius(float ox, float oy, float r)
+{
+    float r2 = r * r;
+
+    for (int rr = 0; rr < ROWS; rr++)
+    {
+        for (int cc = 0; cc < COLS; cc++)
+        {
+            float cx = cc * CELL + X0;
+            float cy = rr * CELL + Y0;
+
+            float dx = cx - ox;
+            float dy = cy - oy;
+
+            if ((dx*dx + dy*dy) <= r2)
+            {
+                if (visits_map[rr][cc] < 1.0f)
+                    visits_map[rr][cc] = 1.0f;
+            }
+        }
+    }
+}
+
+static void mark_obstacle_cells_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2)
+{
+    // snapshot pose atomically
+    float x, y, th;
+    {
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        x  = robot_x;
+        y  = robot_y;
+        th = robot_theta;
+        __set_PRIMASK(primask);
+    }
+
+    // For each sensor above its threshold, project and mark
+    float ox, oy;
+
+    if (s0 > OBSTACLE_TH0_MV)
+    {
+        obstacle_pos_from_pose_and_offset(x, y, th, OBSTACLE_DIST_M, S0_OFF_RAD, &ox, &oy);
+        visits_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
+    }
+
+    if (s1 > OBSTACLE_TH1_MV)
+    {
+        obstacle_pos_from_pose_and_offset(x, y, th, OBSTACLE_DIST_M, S1_OFF_RAD, &ox, &oy);
+        visits_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
+    }
+
+    if (s2 > OBSTACLE_TH2_MV)
+    {
+        obstacle_pos_from_pose_and_offset(x, y, th, OBSTACLE_DIST_M, S2_OFF_RAD, &ox, &oy);
+        visits_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
+    }
 }
 
 /* USER CODE END PV */
@@ -771,19 +862,30 @@ void gotoXY()
 
         case GOTO_DRIVE:
         {
-        	/* before moving check if there is an obstacle in front,
-        	 * in this case, stop moving and penalize the cell,
-        	 * also set state to GOTO_DONE to invalidate the current best_cell
-        	 */
-        	int any_obstacle = obstacle_in_front();
-        	if (any_obstacle==1)
-        	{
-        		penalize_target_cell();
-                set_M_speeds(STOP_SPEED, STOP_SPEED);
-                motor_L = STOP_SPEED;
-                motor_R = STOP_SPEED;
-        		goto_state = GOTO_DONE;
-        	}
+        	uint16_t s0, s1, s2;
+			// atomic snapshot of sensors
+			{
+				uint32_t primask = __get_PRIMASK();
+				__disable_irq();
+				s0 = adc_readings[0];   // front
+				s1 = adc_readings[1];   // +45°
+				s2 = adc_readings[2];   // -45°
+				__set_PRIMASK(primask);
+			}
+
+			int any_obstacle = (s0 > OBSTACLE_TH0_MV) || (s1 > OBSTACLE_TH1_MV) || (s2 > OBSTACLE_TH2_MV);
+
+			if (any_obstacle)
+			{
+				// mark obstacle footprint(s) in the grid using all triggered sensors
+				mark_obstacle_cells_from_three_sensors(s0, s1, s2);
+
+				penalize_target_cell();
+				set_M_speeds(STOP_SPEED, STOP_SPEED);
+				motor_L = STOP_SPEED;
+				motor_R = STOP_SPEED;
+				goto_state = GOTO_DONE;
+			}
             // while driving, if heading error grows too big -> stop and rotate again
         	else if (fabsf(e) > GOTO_THETA_DRIVE_MAX_RAD)
             {
