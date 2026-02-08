@@ -1109,7 +1109,8 @@ void handle_command(void)
 					}
 				}
 
-				// if number of unvisited cells are less than the number of robots, robots should avoid moving if they are not the closest bot to the unvisited cells
+				// if number of unvisited cells are less than the number of robots,
+				// this robot should avoid moving if it is not the closest bot to the unvisited target cell
 				if (unvisited < (n_other_robots+1) && closer_bots_f>0)
 					fittest = -1;
 				// fitness may not be -1 (no cell is celected, or the selected cell was not valid)
