@@ -4,15 +4,15 @@
 
 const char* ssid = "MechalinoAP";
 const char* password = "12345679";
-const int Mechalino_ID = 15;
+const int Mechalino_ID = 16;
 
 ESP8266WebServer server(80);
 
-// Laptop pose server
+// Laptop pos server
 IPAddress laptopIP(192, 168, 50, 1);
-const uint16_t POSE_PORT = 9000;
+const uint16_t POS_PORT = 9000;
 
-WiFiClient poseClient;
+WiFiClient posClient;
 String serialBuf;
 
 // UDP for Inter-swarm connection
@@ -28,16 +28,16 @@ static char udp_rx_buf[256];
 
 static void ensurePoseClientConnected() {
   if (WiFi.status() != WL_CONNECTED) return;
-  if (poseClient.connected()) return;
+  if (posClient.connected()) return;
 
-  poseClient.stop();
-  poseClient.setNoDelay(true);
-  poseClient.setTimeout(1);
+  posClient.stop();
+  posClient.setNoDelay(true);
+  posClient.setTimeout(1);
 
   bool ok = false;
   for (int k = 0; k < 5; k++) {
-    if (poseClient.connect(laptopIP, POSE_PORT)) { ok = true; break; }
-    poseClient.stop();
+    if (posClient.connect(laptopIP, POS_PORT)) { ok = true; break; }
+    posClient.stop();
     delay(10);
     yield();
   }
@@ -47,9 +47,9 @@ static uint8_t requestPoseFromROS(float &x, float &y, float &yaw) {
   if (WiFi.status() != WL_CONNECTED) return 1;   // no WiFi
 
   ensurePoseClientConnected();
-  if (!poseClient.connected()) return 2;
+  if (!posClient.connected()) return 2;
 
-  if (poseClient.print("POSE\n") == 0) { poseClient.stop(); return 3; } // write fail
+  if (posClient.print("POS\n") == 0) { posClient.stop(); return 3; } // write fail
 
   char buf[96];
   size_t idx = 0;
@@ -57,8 +57,8 @@ static uint8_t requestPoseFromROS(float &x, float &y, float &yaw) {
   const uint32_t deadline_ms = 500; // increase for real WiFi jitter
 
   while ((millis() - t0) < deadline_ms) {
-    while (poseClient.available() > 0) {
-      char ch = (char)poseClient.read();
+    while (posClient.available() > 0) {
+      char ch = (char)posClient.read();
       if (ch == '\r') continue;
 
       if (ch == '\n') {
@@ -197,7 +197,7 @@ void loop() {
 
     if (c == '\n') {
       serialBuf.trim();
-      if (serialBuf.indexOf("POSE?") >= 0) {
+      if (serialBuf.indexOf("POS?") >= 0) {
         float x, y, yaw;
         uint8_t e = requestPoseFromROS(x, y, yaw);
         if (e == 0) sendPoseToSTM32(x, y, yaw);
@@ -208,7 +208,7 @@ void loop() {
         }
       }
       else if (serialBuf.startsWith("BPOS#")) {
-        // Broadcast everything after "BPOSE#"
+        // Broadcast everything after "BPOS#"
         const char *payload = serialBuf.c_str() + 5; // skip "BPOS#"
 
         udp.beginPacket(IPAddress(255,255,255,255), UDP_PORT);

@@ -51,8 +51,8 @@ typedef enum {
 /* USER CODE BEGIN PD */
 // Motors PWM values for forward/backward rotation at maximum speed
 #define MOTOR_PWM_STOP 1500
-#define MOTOR_PWM_MAX_FORWARD 1300
-#define MOTOR_PWM_MAX_BACKWARD 1700
+#define MOTOR_PWM_MAX_BACKWARD 1300
+#define MOTOR_PWM_MAX_FORWARD 1700
 // drive/rotate speeds
 #define ROT_CW_L   (MOTOR_PWM_MAX_FORWARD)
 #define ROT_CW_R   (MOTOR_PWM_MAX_FORWARD)
@@ -149,8 +149,8 @@ UART_HandleTypeDef huart2;
 Motors motors;
 
 // Encoder
-volatile int16_t encoder_right_count = 0;
-volatile int16_t encoder_left_count = 0;
+volatile int32_t encoder_right_count = 0;
+volatile int32_t encoder_left_count = 0;
 
 // Distance sensors
 volatile uint16_t adc_buffer[IRD_NUM_SAMPLES];
@@ -175,6 +175,7 @@ char posBuffer[256];
 float robot_x = 0.0f;
 float robot_y = 0.0f;
 float robot_theta = 0.0f;
+float robot_theta_error = 0.0f;
 
 uint8_t initial_pos = 1;
 volatile uint8_t broadcastPOS_due = 0; // flag to broadcast position
@@ -199,7 +200,7 @@ float visits_map[ROWS][COLS] = {0};
 float penalties_map[ROWS][COLS] = {0};
 
 // inter swarm communication
-// posBuffer is used also as oposBuffer
+char oposBuffer[256];
 float other_robots[MAX_OTHER_ROBOTS][2];
 uint8_t other_robots_ids[MAX_OTHER_ROBOTS] = {0};
 uint8_t n_other_robots = 0;
@@ -637,8 +638,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 			{
 				if (!oposReady)
 				{
-					strncpy(posBuffer, rxBuffer, sizeof(posBuffer));
-					posBuffer[sizeof(posBuffer) - 1] = '\0';
+					strncpy(oposBuffer, rxBuffer, sizeof(oposBuffer));
+					oposBuffer[sizeof(oposBuffer) - 1] = '\0';
 					oposReady = 1;
 				}
 			}
@@ -934,7 +935,7 @@ void gotoXY()
 
 	float d = dist_to_target(x, y, xt, yt);
 	float e = heading_error_to_target(x, y, th, xt, yt);  // + => need CW, - => need CCW
-
+	robot_theta_error = e;
 	// stop condition
 	if (d <= GOTO_DIST_OK_M)
 	{
@@ -1040,7 +1041,7 @@ void handle_command(void)
 			{
 				// assumes visits_map to be initialized to 0 TODO: implement and call visit_map_init()
 				visits_map[0][0] = 100; // mark table marker place az visited
-				goto_state = GOTO_DONE;   // start by rotating to face target
+				goto_state = GOTO_DONE;   // wait to first select a cell in goto_done, then start the algorithm from there
 				new_cmd = 0; // reset new_cmd flag
 			}
 			// copy robot_x and robot_y to local x,y
@@ -1083,6 +1084,8 @@ void handle_command(void)
 						cx = c * 0.15f + 0.15f;
 						cy = r * 0.15f + 0.15f;
 						dist = dist_to_target(x, y, cx, cy); // direct distance
+						if (dist < 0.075f) // TODO: make 0.075 (half cell size) a confid parameter
+							continue; // avoid singularity and too close cells
 						D = fpow_simple(dist, 2); // D^mu
 						Dbar = 1;
 						int closer_bots = 0;
@@ -1098,7 +1101,7 @@ void handle_command(void)
 						if (fitness>fittest && dist>=0.075f) //TODO: make 0.075 (half cell size) a confid parameter
 						{
 							// cell can be selected if it is NOT too close
-							fittest = fitness; // save fittest to the current cell's fitness value, as well as other factors
+							fittest = fitness; // candidate this cell as the best cell so far (inc. its properties)
 							closer_bots_f = closer_bots;
 							best_x = cx;
 							best_y = cy;
@@ -1160,7 +1163,7 @@ void handle_opos_if_ready(void)
 		uint32_t primask = __get_PRIMASK();
 		__disable_irq();
 		oposReady = 0;
-		strncpy(local, posBuffer, sizeof(local));
+		strncpy(local, oposBuffer, sizeof(local));
 		local[sizeof(local) - 1] = '\0';
 		__set_PRIMASK(primask);
 	}
@@ -1269,45 +1272,6 @@ void broadcast_pos(void)
 	}
 
 	HAL_UART_Transmit(&huart1, (uint8_t*)tx, (uint16_t)len, 50);
-}
-
-
-static inline int compute_avoid_rotation(int *rot_dir)
-{
-	// rot_dir: -1 = rotate right, +1 = rotate left, 0 = none
-
-	uint16_t s0, s1, s2;
-
-	// atomic snapshot
-	uint32_t primask = __get_PRIMASK();
-	__disable_irq();
-	s0 = adc_readings[0];   // front
-	s1 = adc_readings[1];   // front-right
-	s2 = adc_readings[2];   // front-left
-	__set_PRIMASK(primask);
-
-	if (s0 <= 600 && s1 <= 1000 && s2 <= 1000) {
-		*rot_dir = 0;
-		return 0;
-	}
-
-	if (s0 > 500) {
-		*rot_dir = (s1 > s2) ? +1 : -1;
-		return 1;
-	}
-
-	if (s1 > 500) {
-		*rot_dir = +1;   // rotate left
-		return 1;
-	}
-
-	if (s2 > 500) {
-		*rot_dir = -1;   // rotate right
-		return 1;
-	}
-
-	*rot_dir = 0;
-	return 0;
 }
 // -------------------------------------------------------------------------------------
 
