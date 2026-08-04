@@ -4,7 +4,7 @@
 
 const char* ssid = "MechalinoAP";
 const char* password = "12345679";
-const int Mechalino_ID = 16;
+const int Mechalino_ID = 15;
 
 ESP8266WebServer server(80);
 
@@ -26,6 +26,35 @@ WiFiUDP udp;
 static unsigned long udp_last_tx = 0;
 static char udp_rx_buf[256];
 
+String debugRaw = "";
+
+String dbgVisits = "";
+String dbgPenalties = "";
+String dbgObstacles = "";
+String dbgAdc = "";
+
+volatile bool debugAvailable = false;
+void parseDebugLine(const String &line)
+{
+  debugRaw = line;
+
+  int v0 = line.indexOf("#V:");
+  int p0 = line.indexOf("#P10:");
+  int o0 = line.indexOf("#O:");
+  int a0 = line.indexOf("#A:");
+
+  if (v0 < 0 || p0 < 0 || o0 < 0 || a0 < 0) {
+    return;
+  }
+
+  dbgVisits    = line.substring(v0 + 3, p0);
+  dbgPenalties = line.substring(p0 + 5, o0);
+  dbgObstacles = line.substring(o0 + 3, a0);
+  dbgAdc       = line.substring(a0 + 3);
+
+  debugAvailable = true;
+}
+
 static void ensurePoseClientConnected() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (posClient.connected()) return;
@@ -44,6 +73,8 @@ static void ensurePoseClientConnected() {
 }
 
 static uint8_t requestPoseFromROS(float &x, float &y, float &yaw) {
+  
+  ensurePoseClientConnected();
   if (WiFi.status() != WL_CONNECTED) return 1;   // no WiFi
 
   ensurePoseClientConnected();
@@ -155,6 +186,39 @@ void handleCMD() {
   return;
 }
 
+void handleDebug()
+{
+  if (!debugAvailable) {
+    server.send(404, "text/plain", "No debug data available");
+    return;
+  }
+
+  String rep;
+  rep.reserve(1024);
+
+  rep += "RAW=";
+  rep += debugRaw;
+  rep += "\n\n";
+
+  rep += "VISITS=";
+  rep += dbgVisits;
+  rep += "\n\n";
+
+  rep += "PENALTIES_X10=";
+  rep += dbgPenalties;
+  rep += "\n\n";
+
+  rep += "OBSTACLES=";
+  rep += dbgObstacles;
+  rep += "\n\n";
+
+  rep += "ADC=";
+  rep += dbgAdc;
+  rep += "\n";
+
+  server.send(200, "text/plain", rep);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -177,9 +241,10 @@ void setup() {
   delay(1500);
 
   server.on("/cmd", HTTP_GET, handleCMD);
+  server.on("/debug", HTTP_GET, handleDebug);
   server.begin();
   delay(100);
-  serialBuf.reserve(256);
+  serialBuf.reserve(1200);
   ensurePoseClientConnected();
 
   udp.begin(UDP_PORT);
@@ -187,8 +252,6 @@ void setup() {
 
 void loop() {
   server.handleClient();
-  
-  ensurePoseClientConnected();
 
   static uint32_t last_yield = 0;
   while (Serial.available() > 0) {
@@ -214,11 +277,13 @@ void loop() {
         udp.beginPacket(IPAddress(255,255,255,255), UDP_PORT);
         udp.write((const uint8_t*)payload, strlen(payload));
         udp.endPacket();
+      }else if (serialBuf.startsWith("DEBUG#")) {
+        parseDebugLine(serialBuf);
       }
       serialBuf = "";
     } else {
       serialBuf += c;
-      if (serialBuf.length() > 240) serialBuf = "";
+      if (serialBuf.length() > 1100) serialBuf = "";
     }
     
     if ((millis() - last_yield) > 5) {  // every ~5 ms
