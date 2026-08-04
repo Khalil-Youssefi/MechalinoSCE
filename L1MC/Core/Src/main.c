@@ -73,8 +73,8 @@ typedef enum {
 // Distance sensors
 // Sensors direction relative to robot forward direction
 #define S0_OFF_RAD  (0.0f)
-#define S1_OFF_RAD  (DEG2RAD(+45.0f))                             // s1 is +45 deg
-#define S2_OFF_RAD  (DEG2RAD(-45.0f))                             // s2 is -45 deg
+#define S1_OFF_RAD  (DEG2RAD(-45.0f))                             // s1 is +45 deg
+#define S2_OFF_RAD  (DEG2RAD(+45.0f))                             // s2 is -45 deg
 
 #define IRD_NUM_SAMPLES 15
 
@@ -116,7 +116,7 @@ int path_idx = 0;
 #define MAX_VISIT_AND_PENALTY_COUNT 1000.0f
 
 // inter-swarm communication
-#define MID 15                                                    // Mechalino ID (MID)
+#define MID 16                                                    // Mechalino ID (MID)
 #define MAX_OTHER_ROBOTS 4                                        // max number of others (Maximum Swarm Size=5)
 #define INVALID_MID 222
 
@@ -124,9 +124,10 @@ int path_idx = 0;
 #define REC_WINDOW 5
 
 // obstacle avoidance params
-#define OBSTACLE_DIST_M       0.13f
+#define OBSTACLE_DIST_M       0.15f
 #define OBSTACLE_MARK_R       0.075f
 
+#define OBSTACLE_TH_MV        1500u                                // general
 #define OBSTACLE_TH0_MV       1000u                                // front
 #define OBSTACLE_TH1_MV       1000u                               // front-right
 #define OBSTACLE_TH2_MV       1000u                               // front-left
@@ -166,14 +167,14 @@ volatile int32_t encoder_right_count = 0;
 volatile int32_t encoder_left_count = 0;
 
 // Distance sensors
-#define N_ACIVE_IR_SENSORS 3
+#define N_ACIVE_IR_SENSORS 8
 volatile uint16_t adc_buffer[IRD_NUM_SAMPLES];
 volatile uint16_t adc_readings_off[N_ACIVE_IR_SENSORS];  // active DMUX channels are 0, 1 and 7 when IR LED is off
 volatile uint16_t adc_readings_on[N_ACIVE_IR_SENSORS];  // active DMUX channels are 0, 1 and 7 when IR LED is on
 volatile uint16_t adc_readings[N_ACIVE_IR_SENSORS];  // active DMUX channels are 0, 1 and 7 [difference between on and off]
 uint8_t current_step = 0; // step 0: IR LED off, step 1: IR LED on
 uint8_t current_dmux_index = 0;
-const uint8_t dmux_channels[3] = {0, 1, 7}; // active DMUX channels
+const uint8_t dmux_channels[8] = {0, 1, 2, 3, 4, 5, 6, 7}; // TODO: active DMUX channels
 
 // Serial communication with ESP8266
 uint8_t rxByte;
@@ -286,9 +287,9 @@ static inline void obstacle_pos_from_pos_and_offset(float x, float y, float th,
 		float *ox, float *oy);
 
 //static void visits_map_mark_radius(float ox, float oy, float r);
-static void obstacles_map_mark_radius(float ox, float oy, float r);
+//static void obstacles_map_mark_radius(float ox, float oy, float r);
 //static void mark_obstacle_cells_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2);
-static obs_evt_t mark_obstacles_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2);
+//static obs_evt_t mark_obstacles_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2);
 
 static inline void cell_center(int r, int c, float *cx, float *cy);
 
@@ -892,7 +893,7 @@ float fpow_simple(float base, unsigned exp)
 
 static inline void unit_vec_from_theta(float th, float off, float *ux, float *uy)
 {
-	// Your robot forward is (theta + pi/2). Add sensor offset around that.
+	// robot forward is (theta + pi/2). Add sensor offset around that.
 	float a = th + (float)M_PI_2 + off;
 	*ux = cosf(a);
 	*uy = sinf(a);
@@ -931,27 +932,27 @@ static inline void obstacle_pos_from_pos_and_offset(float x, float y, float th,
 //	}
 //}
 
-static void obstacles_map_mark_radius(float ox, float oy, float r)
-{
-    float r2 = r * r;
-
-    for (int rr = 0; rr < ROWS; rr++)
-    {
-        for (int cc = 0; cc < COLS; cc++)
-        {
-            float cx = cc * CELL + X0;
-            float cy = rr * CELL + Y0;
-
-            float dx = cx - ox;
-            float dy = cy - oy;
-
-            if ((dx*dx + dy*dy) <= r2)
-            {
-                obstacles_map[rr][cc] = 1.0f;   // occupied
-            }
-        }
-    }
-}
+//static void obstacles_map_mark_radius(float ox, float oy, float r)
+//{
+//    float r2 = r * r;
+//
+//    for (int rr = 0; rr < ROWS; rr++)
+//    {
+//        for (int cc = 0; cc < COLS; cc++)
+//        {
+//            float cx = cc * CELL + X0;
+//            float cy = rr * CELL + Y0;
+//
+//            float dx = cx - ox;
+//            float dy = cy - oy;
+//
+//            if ((dx*dx + dy*dy) <= r2)
+//            {
+//                obstacles_map[rr][cc] = 1.0f;   // occupied
+//            }
+//        }
+//    }
+//}
 
 //static void mark_obstacle_cells_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2)
 //{
@@ -988,42 +989,42 @@ static void obstacles_map_mark_radius(float ox, float oy, float r)
 //	}
 //}
 
-static obs_evt_t mark_obstacles_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2)
-{
-    float x, y, th;
-    {
-        uint32_t primask = __get_PRIMASK();
-        __disable_irq();
-        x  = robot_x;
-        y  = robot_y;
-        th = robot_theta;
-        __set_PRIMASK(primask);
-    }
-
-    float ox, oy;
-    obs_evt_t evt = OBS_EVT_NONE;
-
-    if (s0 > OBSTACLE_TH0_MV) {
-        obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S0_OFF_RAD, &ox, &oy);
-        if (near_known_robot(ox, oy, ROBOT_AS_OBS_GATE_M)) return OBS_EVT_ROBOT;
-        obstacles_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
-        evt = OBS_EVT_STATIC;
-    }
-    if (s1 > OBSTACLE_TH1_MV) {
-        obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S1_OFF_RAD, &ox, &oy);
-        if (near_known_robot(ox, oy, ROBOT_AS_OBS_GATE_M)) return OBS_EVT_ROBOT;
-        obstacles_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
-        evt = OBS_EVT_STATIC;
-    }
-    if (s2 > OBSTACLE_TH2_MV) {
-        obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S2_OFF_RAD, &ox, &oy);
-        if (near_known_robot(ox, oy, ROBOT_AS_OBS_GATE_M)) return OBS_EVT_ROBOT;
-        obstacles_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
-        evt = OBS_EVT_STATIC;
-    }
-
-    return evt;
-}
+//static obs_evt_t mark_obstacles_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2)
+//{
+//    float x, y, th;
+//    {
+//        uint32_t primask = __get_PRIMASK();
+//        __disable_irq();
+//        x  = robot_x;
+//        y  = robot_y;
+//        th = robot_theta;
+//        __set_PRIMASK(primask);
+//    }
+//
+//    float ox, oy;
+//    obs_evt_t evt = OBS_EVT_NONE;
+//
+//    if (s0 > OBSTACLE_TH0_MV) {
+//        obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S0_OFF_RAD, &ox, &oy);
+//        if (near_known_robot(ox, oy, ROBOT_AS_OBS_GATE_M)) return OBS_EVT_ROBOT;
+//        obstacles_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
+//        evt = OBS_EVT_STATIC;
+//    }
+//    if (s1 > OBSTACLE_TH1_MV) {
+//        obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S1_OFF_RAD, &ox, &oy);
+//        if (near_known_robot(ox, oy, ROBOT_AS_OBS_GATE_M)) return OBS_EVT_ROBOT;
+//        obstacles_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
+//        evt = OBS_EVT_STATIC;
+//    }
+//    if (s2 > OBSTACLE_TH2_MV) {
+//        obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S2_OFF_RAD, &ox, &oy);
+//        if (near_known_robot(ox, oy, ROBOT_AS_OBS_GATE_M)) return OBS_EVT_ROBOT;
+//        obstacles_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
+//        evt = OBS_EVT_STATIC;
+//    }
+//
+//    return evt;
+//}
 
 static inline void cell_center(int r, int c, float *cx, float *cy)
 {
@@ -1293,7 +1294,8 @@ void gotoXY()
 			offset = S2_OFF_RAD;
 		}
 
-		if (s_max > OBSTACLE_TH0_MV)
+		// For the sensor with largest value, project and mark
+		if (s_max > OBSTACLE_TH_MV)
 		{
 			// mark obstacle footprint
 			// snapshot pos atomically
@@ -1307,44 +1309,37 @@ void gotoXY()
 				__set_PRIMASK(primask);
 			}
 
-			// For each sensor above its threshold, project and mark
 			float ox, oy;
 			obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, offset, &ox, &oy);
-			visits_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
-
-			if (evt == OBS_EVT_ROBOT)
+			// obstacle cell
+			int oc_c = round_nearest((ox - X0) / CELL);
+			int oc_r = round_nearest((oy - Y0) / CELL);
+			// current cell can't be marked as obstacle, because the robot is there
+			int cc_c = round_nearest((x - X0) / CELL);
+			int cc_r = round_nearest((y - Y0) / CELL);
+			if (oc_c >= 0 && oc_c < COLS && oc_r >= 0 && oc_r < ROWS && !(oc_r == cc_r && oc_c == cc_c)) {
+				obstacles_map[oc_r][oc_c] = 1.0f; // mark cell as occupied
+				if (visits_map[oc_r][oc_c] == 0)
+				{
+					discount_penalties();
+					// update recovey window
+					rec_push_cell(oc_r, oc_c);
+				}
+				visits_map[oc_r][oc_c] = 1000.0f; // mark cell as visited to avoid it in the future
+			}
+			else
 			{
-			    penalize_target_cell();
-			    Motors_Stop(&motors);
-			    goto_state = GOTO_DONE;   // force reselection next cycle
-			    return;                   // IMPORTANT: do not replan
+				penalize_target_cell(); // if the projected obstacle is out of bounds or on the current cell, just penalize the target cell to avoid it in the future
 			}
-
-			// evt is STATIC (or NONE but any_obstacle implies likely STATIC)
+			Motors_SetPWM(&motors, MOTOR_PWM_MAX_BACKWARD, MOTOR_PWM_MAX_FORWARD);
+			HAL_Delay(600); // TODO: param
 			Motors_Stop(&motors);
-
-			// 3) compute current cell (sr, sc)
-			int sc = round_nearest((x - X0) / CELL);
-			int sr = round_nearest((y - Y0) / CELL);
-			if (sc < 0) sc = 0;
-			if (sc >= COLS) sc = COLS - 1;
-			if (sr < 0) sr = 0;
-			if (sr >= ROWS) sr = ROWS - 1;
-
-			// 4) replan to the same target cell (yt_i, xt_i)
-			if (astar_plan_cells(sr, sc, yt_i, xt_i) && path_len > 0) {
-			    path_idx = 0;
-			    cell_center(path_r[0], path_c[0], &xt, &yt);
-			    goto_state = GOTO_ROTATE;
-			} else {
-			    penalize_target_cell();
-			    goto_state = GOTO_DONE;
-			}
-
+			goto_state = GOTO_DONE; // stop and wait for next command to replan, because the current path is now invalid
 			return; // important: don’t continue the old drive logic after replanning
 		}
+
 		// while driving, if heading error grows too big -> stop and rotate again
-		else if (fabsf(e) > GOTO_THETA_DRIVE_MAX_RAD)
+		if (fabsf(e) > GOTO_THETA_DRIVE_MAX_RAD)
 		{
 			Motors_Stop(&motors);
 			goto_state = GOTO_ROTATE;
@@ -1389,16 +1384,18 @@ void handle_command(void)
 			if (new_cmd)
 			{
 				// assumes visits_map to be initialized to 0 TODO: implement and call visit_map_init()
-				visits_map[0][0] = 100; // mark table marker place az visited
+				visits_map[0][0] = 1000.0f; // mark table marker place az visited
+				obstacles_map[0][0] = 1.0f; // mark table marker place az obstacle
 				goto_state = GOTO_DONE;   // wait to first select a cell in goto_done, then start the algorithm from there
 				new_cmd = 0; // reset new_cmd flag
 			}
 			// copy robot_x and robot_y to local x,y
 			uint32_t primask = __get_PRIMASK();
-			float x,y;
+			float x,y,th;
 			__disable_irq();
 			x = robot_x;
 			y = robot_y;
+			th = robot_theta;
 			__set_PRIMASK(primask);
 			// mark current place as visited for this robot and other known robots
 			visits_map_update(x, y);
@@ -1413,7 +1410,7 @@ void handle_command(void)
 //				float best_x, best_y; //local var for best cell coordinates
 				int closer_bots_f = 0; // number of other_robots that are closer to the potential best cell
 				float fittest = -1; // fitness value to be maximised, initially -1
-				float Ar, D, Dbar,fitness,dist,cx,cy; // Ar = A reverse, D = distance to self, Dbar = distance to other robots
+				float Ar, R, D, Dbar,fitness,dist,angle,cx,cy; // Ar = A reverse, D = distance to self, Dbar = distance to other robots
 				uint8_t unvisited = 0; // number of unvisited cells, important for both:
 				                       // 1. termination condition and also,
 				                       // 2. for the last cells, closer robots attemp to visit them
@@ -1432,14 +1429,16 @@ void handle_command(void)
 						// TODO: param - SCE coefficinets must be config parameters and not hard coded!
 						// A = 1/(visits + penalties)
 						// Ar = (1/A)
-						Ar = fpow_simple(visits_map[r][c] + penalties_map[r][c], 10) + 1.0f; // Ar^kappa
+						Ar = fpow_simple(visits_map[r][c] + penalties_map[r][c], 8) + 1.0f; // Ar^kappa
 						// center of the cell
 						cx = c * 0.15f + 0.15f; // + 0.15 => 0.75f (half cell) + 0.75f (safety not to cover the marker)
 						cy = r * 0.15f + 0.15f; // + 0.15 => 0.75f (half cell) + 0.75f (safety not to cover the marker)
 						dist = dist_to_target(x, y, cx, cy); // direct distance
+						angle = desired_theta_to_target(x, y, th, cx, cy);
 						if (dist < 0.075f) // TODO: param - make 0.075 (half cell size) a confid parameter
 							continue; // avoid singularity and too close cells
-						D = fpow_simple(dist, 2); // D^mu
+						D = fpow_simple(dist, 4); // D^mu
+						R = 1+2.0f*fabsf(angle); // add angle difference penalty, TODO: param - make the weight of angle penalty a config parameter
 						Dbar = 1;
 						int closer_bots = 0;
 						for (int i = 0; i < n_other_robots; i++)
@@ -1449,8 +1448,8 @@ void handle_command(void)
 							if (dist_to_other_robot < dist)
 								closer_bots++;
 						}
-						Dbar = fpow_simple(Dbar, 2); // Dbar^lambda
-						fitness = Dbar / (Ar*D); // F = A^kappa * Dbar^mu / D^lambda = Dbar^mu / (Ar^kappa * D^mu)
+						Dbar = fpow_simple(Dbar, 4); // Dbar^lambda
+						fitness = (Dbar*R) / (Ar*D); // F = A^kappa * Dbar^mu / D^lambda = Dbar^mu / (Ar^kappa * D^mu)
 						if (fitness>fittest && dist>=0.075f) //TODO: param -make 0.075 (half cell size) a confid parameter
 						{
 							// cell can be selected if it is NOT too close
