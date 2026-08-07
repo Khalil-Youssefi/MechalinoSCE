@@ -45,6 +45,12 @@ typedef enum {
 	GOTO_DRIVE,
 	GOTO_DONE
 } goto_state_t;
+
+typedef enum {
+    OBS_EVT_NONE = 0,     // no obstacle-related action taken
+    OBS_EVT_STATIC = 1,   // static obstacle mapped
+    OBS_EVT_ROBOT  = 2    // hit was likely another robot -> abandon target
+} obs_evt_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -67,8 +73,8 @@ typedef enum {
 // Distance sensors
 // Sensors direction relative to robot forward direction
 #define S0_OFF_RAD  (0.0f)
-#define S1_OFF_RAD  (DEG2RAD(+45.0f))                             // s1 is +45 deg
-#define S2_OFF_RAD  (DEG2RAD(-45.0f))                             // s2 is -45 deg
+#define S1_OFF_RAD  (DEG2RAD(-45.0f))                             // s1 is +45 deg
+#define S2_OFF_RAD  (DEG2RAD(+45.0f))                             // s2 is -45 deg
 
 #define IRD_NUM_SAMPLES 15
 
@@ -95,10 +101,15 @@ typedef enum {
 
 // grid parameters
 #define CELL   0.15f
-#define X0     0.15f
-#define Y0     0.15f
+#define X0     0.15f // 0.75f (half cell) + 0.75f (safety not to cover the marker)
+#define Y0     0.15f // 0.75f (half cell) + 0.75f (safety not to cover the marker)
 #define COLS   11
 #define ROWS   4
+
+int path_r[ROWS*COLS];
+int path_c[ROWS*COLS];
+int path_len = 0;
+int path_idx = 0;
 
 // grid special values
 #define INVALID_POS -1000.0f
@@ -113,14 +124,17 @@ typedef enum {
 #define REC_WINDOW 5
 
 // obstacle avoidance params
-#define OBSTACLE_DIST_M       0.17f
+#define OBSTACLE_DIST_M       0.15f
 #define OBSTACLE_MARK_R       0.075f
 
-#define OBSTACLE_TH0_MV       900u                                // front
-#define OBSTACLE_TH1_MV       1200u                               // front-right
-#define OBSTACLE_TH2_MV       1200u                               // front-left
+#define OBSTACLE_TH_MV        1500u                                // general
+#define OBSTACLE_TH0_MV       1000u                                // front
+#define OBSTACLE_TH1_MV       1000u                               // front-right
+#define OBSTACLE_TH2_MV       1000u                               // front-left
 
 #define DEG2RAD(x) ((x) * (float)M_PI / 180.0f)
+
+#define ROBOT_AS_OBS_GATE_M  0.18f   // distance threshold to treat hit as another robot
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -153,13 +167,14 @@ volatile int32_t encoder_right_count = 0;
 volatile int32_t encoder_left_count = 0;
 
 // Distance sensors
+#define N_ACIVE_IR_SENSORS 8
 volatile uint16_t adc_buffer[IRD_NUM_SAMPLES];
-volatile uint16_t adc_readings_off[3];  // active DMUX channels are 0, 1 and 7 when IR LED is off
-volatile uint16_t adc_readings_on[3];  // active DMUX channels are 0, 1 and 7 when IR LED is on
-volatile uint16_t adc_readings[3];  // active DMUX channels are 0, 1 and 7 [difference between on and off]
+volatile uint16_t adc_readings_off[N_ACIVE_IR_SENSORS];  // active DMUX channels are 0, 1 and 7 when IR LED is off
+volatile uint16_t adc_readings_on[N_ACIVE_IR_SENSORS];  // active DMUX channels are 0, 1 and 7 when IR LED is on
+volatile uint16_t adc_readings[N_ACIVE_IR_SENSORS];  // active DMUX channels are 0, 1 and 7 [difference between on and off]
 uint8_t current_step = 0; // step 0: IR LED off, step 1: IR LED on
 uint8_t current_dmux_index = 0;
-const uint8_t dmux_channels[3] = {0, 1, 7}; // active DMUX channels
+const uint8_t dmux_channels[8] = {0, 1, 2, 3, 4, 5, 6, 7}; // TODO: active DMUX channels
 
 // Serial communication with ESP8266
 uint8_t rxByte;
@@ -198,6 +213,10 @@ int xt_i, yt_i; // grid indices of the target cell
 // SCE memory
 float visits_map[ROWS][COLS] = {0};
 float penalties_map[ROWS][COLS] = {0};
+float obstacles_map[ROWS][COLS] = {0};
+
+uint8_t obs_hits = 0;
+#define OBS_HITS_N  3   // require 3 consecutive detections
 
 // inter swarm communication
 char oposBuffer[256];
@@ -267,10 +286,21 @@ static inline void obstacle_pos_from_pos_and_offset(float x, float y, float th,
 		float dist_m, float off_rad,
 		float *ox, float *oy);
 
-static void visits_map_mark_radius(float ox, float oy, float r);
-static void mark_obstacle_cells_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2);
+//static void visits_map_mark_radius(float ox, float oy, float r);
+//static void obstacles_map_mark_radius(float ox, float oy, float r);
+//static void mark_obstacle_cells_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2);
+//static obs_evt_t mark_obstacles_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2);
+
+static inline void cell_center(int r, int c, float *cx, float *cy);
+
 
 /* --- GOTO XY helpers + state machine --- */
+static inline int cell_is_free(int r, int c);
+static inline float h_manhattan(int r, int c, int tr, int tc);
+static int astar_plan_cells(int sr, int sc, int tr, int tc);
+
+static inline int near_known_robot(float ox, float oy, float gate_m);
+
 static float wrap_pi(float a);
 
 static float desired_theta_to_target(float x, float y, float th, float tx, float ty);
@@ -285,6 +315,75 @@ void handle_command(void);
 /* --- Inter-swarm / broadcasts --- */
 void handle_opos_if_ready(void);
 void broadcast_pos(void);
+
+/* --- DEBGUG --- */
+void debug_send_state(void)
+{
+    static char tx[1024];
+    int len = 0;
+
+    uint16_t adc0, adc1, adc2;
+
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    adc0 = adc_readings[0];
+    adc1 = adc_readings[1];
+    adc2 = adc_readings[2];
+    __set_PRIMASK(primask);
+
+    len += snprintf(tx + len, sizeof(tx) - len, "DEBUG#V:");
+
+    for (int r = 0; r < ROWS; r++)
+    {
+        if (r > 0) len += snprintf(tx + len, sizeof(tx) - len, ";");
+
+        for (int c = 0; c < COLS; c++)
+        {
+            uint16_t v = (uint16_t)(visits_map[r][c] + 0.5f);
+            len += snprintf(tx + len, sizeof(tx) - len,
+                            "%u%s", v, (c == COLS - 1) ? "" : ",");
+        }
+    }
+
+    len += snprintf(tx + len, sizeof(tx) - len, "#P10:");
+
+    for (int r = 0; r < ROWS; r++)
+    {
+        if (r > 0) len += snprintf(tx + len, sizeof(tx) - len, ";");
+
+        for (int c = 0; c < COLS; c++)
+        {
+            uint16_t p = (uint16_t)(penalties_map[r][c] * 10.0f + 0.5f);
+            len += snprintf(tx + len, sizeof(tx) - len,
+                            "%u%s", p, (c == COLS - 1) ? "" : ",");
+        }
+    }
+
+    len += snprintf(tx + len, sizeof(tx) - len, "#O:");
+
+    for (int r = 0; r < ROWS; r++)
+    {
+        uint16_t mask = 0;
+
+        for (int c = 0; c < COLS; c++)
+        {
+            if (obstacles_map[r][c] >= 1.0f)
+                mask |= (1u << c);
+        }
+
+        len += snprintf(tx + len, sizeof(tx) - len,
+                        "%03X%s", mask, (r == ROWS - 1) ? "" : ",");
+    }
+
+    len += snprintf(tx + len, sizeof(tx) - len,
+                    "#A:%u,%u,%u\n",
+                    adc0, adc1, adc2);
+
+    if (len > 0 && len < (int)sizeof(tx))
+    {
+        HAL_UART_Transmit(&huart1, (uint8_t*)tx, (uint16_t)len, 100);
+    }
+}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -395,8 +494,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void update_odometry(void) {
 	uint32_t primask = __get_PRIMASK();
 	__disable_irq();
-	int16_t curr_left  = encoder_left_count;
-	int16_t curr_right = encoder_right_count;
+	int32_t curr_left  = encoder_left_count;
+	int32_t curr_right = encoder_right_count;
 	__set_PRIMASK(primask);
 
 	static int32_t prev_left = 0;
@@ -590,9 +689,9 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 
 			// Move to next channel
 			current_dmux_index++;
-			if(current_dmux_index >= 3) {
+			if(current_dmux_index >= N_ACIVE_IR_SENSORS) { // TODO: make it a param
 				current_dmux_index = 0;
-				// All 3 channels complete!
+				// All N_ACIVE_IR_SENSORS channels complete!
 			}
 
 			// Set new DMUX address for next channel
@@ -794,7 +893,7 @@ float fpow_simple(float base, unsigned exp)
 
 static inline void unit_vec_from_theta(float th, float off, float *ux, float *uy)
 {
-	// Your robot forward is (theta + pi/2). Add sensor offset around that.
+	// robot forward is (theta + pi/2). Add sensor offset around that.
 	float a = th + (float)M_PI_2 + off;
 	*ux = cosf(a);
 	*uy = sinf(a);
@@ -810,62 +909,256 @@ static inline void obstacle_pos_from_pos_and_offset(float x, float y, float th,
 	*oy = y + dist_m * uy;
 }
 
-static void visits_map_mark_radius(float ox, float oy, float r)
+//static void visits_map_mark_radius(float ox, float oy, float r)
+//{
+//	float r2 = r * r;
+//
+//	for (int rr = 0; rr < ROWS; rr++)
+//	{
+//		for (int cc = 0; cc < COLS; cc++)
+//		{
+//			float cx = cc * CELL + X0;
+//			float cy = rr * CELL + Y0;
+//
+//			float dx = cx - ox;
+//			float dy = cy - oy;
+//
+//			if ((dx*dx + dy*dy) <= r2)
+//			{
+//				if (visits_map[rr][cc] < 1.0f)
+//					visits_map[rr][cc] = 1.0f;
+//			}
+//		}
+//	}
+//}
+
+//static void obstacles_map_mark_radius(float ox, float oy, float r)
+//{
+//    float r2 = r * r;
+//
+//    for (int rr = 0; rr < ROWS; rr++)
+//    {
+//        for (int cc = 0; cc < COLS; cc++)
+//        {
+//            float cx = cc * CELL + X0;
+//            float cy = rr * CELL + Y0;
+//
+//            float dx = cx - ox;
+//            float dy = cy - oy;
+//
+//            if ((dx*dx + dy*dy) <= r2)
+//            {
+//                obstacles_map[rr][cc] = 1.0f;   // occupied
+//            }
+//        }
+//    }
+//}
+
+//static void mark_obstacle_cells_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2)
+//{
+//	// snapshot pos atomically
+//	float x, y, th;
+//	{
+//		uint32_t primask = __get_PRIMASK();
+//		__disable_irq();
+//		x  = robot_x;
+//		y  = robot_y;
+//		th = robot_theta;
+//		__set_PRIMASK(primask);
+//	}
+//
+//	// For each sensor above its threshold, project and mark
+//	float ox, oy;
+//
+//	if (s0 > OBSTACLE_TH0_MV)
+//	{
+//		obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S0_OFF_RAD, &ox, &oy);
+//		visits_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
+//	}
+//
+//	if (s1 > OBSTACLE_TH1_MV)
+//	{
+//		obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S1_OFF_RAD, &ox, &oy);
+//		visits_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
+//	}
+//
+//	if (s2 > OBSTACLE_TH2_MV)
+//	{
+//		obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S2_OFF_RAD, &ox, &oy);
+//		visits_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
+//	}
+//}
+
+//static obs_evt_t mark_obstacles_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2)
+//{
+//    float x, y, th;
+//    {
+//        uint32_t primask = __get_PRIMASK();
+//        __disable_irq();
+//        x  = robot_x;
+//        y  = robot_y;
+//        th = robot_theta;
+//        __set_PRIMASK(primask);
+//    }
+//
+//    float ox, oy;
+//    obs_evt_t evt = OBS_EVT_NONE;
+//
+//    if (s0 > OBSTACLE_TH0_MV) {
+//        obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S0_OFF_RAD, &ox, &oy);
+//        if (near_known_robot(ox, oy, ROBOT_AS_OBS_GATE_M)) return OBS_EVT_ROBOT;
+//        obstacles_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
+//        evt = OBS_EVT_STATIC;
+//    }
+//    if (s1 > OBSTACLE_TH1_MV) {
+//        obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S1_OFF_RAD, &ox, &oy);
+//        if (near_known_robot(ox, oy, ROBOT_AS_OBS_GATE_M)) return OBS_EVT_ROBOT;
+//        obstacles_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
+//        evt = OBS_EVT_STATIC;
+//    }
+//    if (s2 > OBSTACLE_TH2_MV) {
+//        obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S2_OFF_RAD, &ox, &oy);
+//        if (near_known_robot(ox, oy, ROBOT_AS_OBS_GATE_M)) return OBS_EVT_ROBOT;
+//        obstacles_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
+//        evt = OBS_EVT_STATIC;
+//    }
+//
+//    return evt;
+//}
+
+static inline void cell_center(int r, int c, float *cx, float *cy)
 {
-	float r2 = r * r;
-
-	for (int rr = 0; rr < ROWS; rr++)
-	{
-		for (int cc = 0; cc < COLS; cc++)
-		{
-			float cx = cc * CELL + X0;
-			float cy = rr * CELL + Y0;
-
-			float dx = cx - ox;
-			float dy = cy - oy;
-
-			if ((dx*dx + dy*dy) <= r2)
-			{
-				if (visits_map[rr][cc] < 1.0f)
-					visits_map[rr][cc] = 1.0f;
-			}
-		}
-	}
+    *cx = c * CELL + X0;
+    *cy = r * CELL + Y0;
 }
 
-static void mark_obstacle_cells_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2)
+static inline int cell_is_free(int r, int c)
 {
-	// snapshot pos atomically
-	float x, y, th;
-	{
-		uint32_t primask = __get_PRIMASK();
-		__disable_irq();
-		x  = robot_x;
-		y  = robot_y;
-		th = robot_theta;
-		__set_PRIMASK(primask);
-	}
+    if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return 0;
+    return (obstacles_map[r][c] < 1.0f);
+}
 
-	// For each sensor above its threshold, project and mark
-	float ox, oy;
+static inline float h_manhattan(int r, int c, int tr, int tc)
+{
+    int dr = (r > tr) ? (r - tr) : (tr - r);
+    int dc = (c > tc) ? (c - tc) : (tc - c);
+    return (float)(dr + dc);
+}
 
-	if (s0 > OBSTACLE_TH0_MV)
-	{
-		obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S0_OFF_RAD, &ox, &oy);
-		visits_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
-	}
+static int astar_plan_cells(int sr, int sc, int tr, int tc)
+{
+    // arrays
+    static uint8_t open[ROWS][COLS];
+    static uint8_t closed[ROWS][COLS];
+    static float   g[ROWS][COLS];
+    static float   f[ROWS][COLS];
+    static int16_t pr[ROWS][COLS];
+    static int16_t pc[ROWS][COLS];
 
-	if (s1 > OBSTACLE_TH1_MV)
-	{
-		obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S1_OFF_RAD, &ox, &oy);
-		visits_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
-	}
+    // init
+    for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) {
+            open[r][c] = 0;
+            closed[r][c] = 0;
+            g[r][c] = 1e9f;
+            f[r][c] = 1e9f;
+            pr[r][c] = -1;
+            pc[r][c] = -1;
+        }
+    }
 
-	if (s2 > OBSTACLE_TH2_MV)
-	{
-		obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S2_OFF_RAD, &ox, &oy);
-		visits_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
-	}
+    if (!cell_is_free(sr, sc)) return 0;
+    if (!cell_is_free(tr, tc)) return 0;
+
+    open[sr][sc] = 1;
+    g[sr][sc] = 0.0f;
+    f[sr][sc] = h_manhattan(sr, sc, tr, tc);
+
+    // A*
+    while (1)
+    {
+        // find best open node
+        int cr = -1, cc = -1;
+        float best_f = 1e9f;
+        for (int r = 0; r < ROWS; r++) {
+            for (int c = 0; c < COLS; c++) {
+                if (open[r][c] && f[r][c] < best_f) {
+                    best_f = f[r][c];
+                    cr = r; cc = c;
+                }
+            }
+        }
+        if (cr < 0) return 0;              // no path
+        if (cr == tr && cc == tc) break;   // reached
+
+        open[cr][cc] = 0;
+        closed[cr][cc] = 1;
+
+        // 4-neighbors
+        static const int dr4[4] = { -1, +1,  0,  0 };
+        static const int dc4[4] = {  0,  0, -1, +1 };
+
+        for (int k = 0; k < 4; k++)
+        {
+            int nr = cr + dr4[k];
+            int nc = cc + dc4[k];
+
+            if (!cell_is_free(nr, nc)) continue;
+            if (closed[nr][nc]) continue;
+
+            float tentative_g = g[cr][cc] + 1.0f; // uniform cost
+
+            if (!open[nr][nc] || tentative_g < g[nr][nc])
+            {
+                pr[nr][nc] = (int16_t)cr;
+                pc[nr][nc] = (int16_t)cc;
+                g[nr][nc] = tentative_g;
+                f[nr][nc] = tentative_g + h_manhattan(nr, nc, tr, tc);
+                open[nr][nc] = 1;
+            }
+        }
+    }
+
+    // reconstruct path into path_r/path_c (reverse, then flip)
+    int rr = tr, cc = tc;
+    int tmp_r[ROWS*COLS];
+    int tmp_c[ROWS*COLS];
+    int tmp_len = 0;
+
+    while (!(rr == sr && cc == sc))
+    {
+        if (tmp_len >= ROWS*COLS) return 0;
+        tmp_r[tmp_len] = rr;
+        tmp_c[tmp_len] = cc;
+        tmp_len++;
+
+        int16_t ppr = pr[rr][cc];
+        int16_t ppc = pc[rr][cc];
+        if (ppr < 0 || ppc < 0) return 0; // should not happen
+        rr = ppr;
+        cc = ppc;
+    }
+
+    // include start? we don't need it as waypoint, so we flip only the moves
+    path_len = tmp_len;
+    path_idx = 0;
+    for (int i = 0; i < tmp_len; i++) {
+        path_r[i] = tmp_r[tmp_len - 1 - i];
+        path_c[i] = tmp_c[tmp_len - 1 - i];
+    }
+
+    return 1;
+}
+
+static inline int near_known_robot(float ox, float oy, float gate_m)
+{
+    float gate2 = gate_m * gate_m;
+    for (int i = 0; i < n_other_robots; i++) {
+        float dx = other_robots[i][0] - ox;
+        float dy = other_robots[i][1] - oy;
+        if ((dx*dx + dy*dy) <= gate2) return 1;
+    }
+    return 0;
 }
 
 static float wrap_pi(float a)
@@ -940,7 +1233,14 @@ void gotoXY()
 	if (d <= GOTO_DIST_OK_M)
 	{
 		Motors_Stop(&motors);
-		goto_state = GOTO_DONE;
+
+		path_idx++;
+		if (path_idx >= path_len) {
+		    goto_state = GOTO_DONE;
+		} else {
+		    cell_center(path_r[path_idx], path_c[path_idx], &xt, &yt);
+		    goto_state = GOTO_ROTATE;
+		}
 		return;
 	}
 
@@ -982,20 +1282,64 @@ void gotoXY()
 			s2 = adc_readings[2];   // -45°
 			__set_PRIMASK(primask);
 		}
-
-		int any_obstacle = (s0 > OBSTACLE_TH0_MV) || (s1 > OBSTACLE_TH1_MV) || (s2 > OBSTACLE_TH2_MV);
-
-		if (any_obstacle)
-		{
-			// mark obstacle footprint(s) in the grid using all triggered sensors
-			mark_obstacle_cells_from_three_sensors(s0, s1, s2);
-
-			penalize_target_cell();
-			Motors_Stop(&motors);
-			goto_state = GOTO_DONE;
+		// get max of sensor values
+		uint16_t s_max = s0;
+		float offset = 0.0f;
+		if (s1 > s_max) {
+			s_max = s1;
+			offset = S1_OFF_RAD;
 		}
+		else if (s2 > s_max) {
+			s_max = s2;
+			offset = S2_OFF_RAD;
+		}
+
+		// For the sensor with largest value, project and mark
+		if (s_max > OBSTACLE_TH_MV)
+		{
+			// mark obstacle footprint
+			// snapshot pos atomically
+			float x, y, th;
+			{
+				uint32_t primask = __get_PRIMASK();
+				__disable_irq();
+				x  = robot_x;
+				y  = robot_y;
+				th = robot_theta;
+				__set_PRIMASK(primask);
+			}
+
+			float ox, oy;
+			obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, offset, &ox, &oy);
+			// obstacle cell
+			int oc_c = round_nearest((ox - X0) / CELL);
+			int oc_r = round_nearest((oy - Y0) / CELL);
+			// current cell can't be marked as obstacle, because the robot is there
+			int cc_c = round_nearest((x - X0) / CELL);
+			int cc_r = round_nearest((y - Y0) / CELL);
+			if (oc_c >= 0 && oc_c < COLS && oc_r >= 0 && oc_r < ROWS && !(oc_r == cc_r && oc_c == cc_c)) {
+				obstacles_map[oc_r][oc_c] = 1.0f; // mark cell as occupied
+				if (visits_map[oc_r][oc_c] == 0)
+				{
+					discount_penalties();
+					// update recovey window
+					rec_push_cell(oc_r, oc_c);
+				}
+				visits_map[oc_r][oc_c] = 1000.0f; // mark cell as visited to avoid it in the future
+			}
+			else
+			{
+				penalize_target_cell(); // if the projected obstacle is out of bounds or on the current cell, just penalize the target cell to avoid it in the future
+			}
+			Motors_SetPWM(&motors, MOTOR_PWM_MAX_BACKWARD, MOTOR_PWM_MAX_FORWARD);
+			HAL_Delay(600); // TODO: param
+			Motors_Stop(&motors);
+			goto_state = GOTO_DONE; // stop and wait for next command to replan, because the current path is now invalid
+			return; // important: don’t continue the old drive logic after replanning
+		}
+
 		// while driving, if heading error grows too big -> stop and rotate again
-		else if (fabsf(e) > GOTO_THETA_DRIVE_MAX_RAD)
+		if (fabsf(e) > GOTO_THETA_DRIVE_MAX_RAD)
 		{
 			Motors_Stop(&motors);
 			goto_state = GOTO_ROTATE;
@@ -1040,16 +1384,18 @@ void handle_command(void)
 			if (new_cmd)
 			{
 				// assumes visits_map to be initialized to 0 TODO: implement and call visit_map_init()
-				visits_map[0][0] = 100; // mark table marker place az visited
+				visits_map[0][0] = 1000.0f; // mark table marker place az visited
+				obstacles_map[0][0] = 1.0f; // mark table marker place az obstacle
 				goto_state = GOTO_DONE;   // wait to first select a cell in goto_done, then start the algorithm from there
 				new_cmd = 0; // reset new_cmd flag
 			}
 			// copy robot_x and robot_y to local x,y
 			uint32_t primask = __get_PRIMASK();
-			float x,y;
+			float x,y,th;
 			__disable_irq();
 			x = robot_x;
 			y = robot_y;
+			th = robot_theta;
 			__set_PRIMASK(primask);
 			// mark current place as visited for this robot and other known robots
 			visits_map_update(x, y);
@@ -1061,32 +1407,38 @@ void handle_command(void)
 			if (goto_state == GOTO_DONE)
 			{
 				// find the next best cell to go
-				float best_x, best_y; //local var for best cell coordinates
+//				float best_x, best_y; //local var for best cell coordinates
 				int closer_bots_f = 0; // number of other_robots that are closer to the potential best cell
 				float fittest = -1; // fitness value to be maximised, initially -1
-				float Ar, D, Dbar,fitness,dist,cx,cy; // Ar = A reverse, D = distance to self, Dbar = distance to other robots
+				float Ar, R, D, Dbar,fitness,dist,angle,cx,cy; // Ar = A reverse, D = distance to self, Dbar = distance to other robots
 				uint8_t unvisited = 0; // number of unvisited cells, important for both:
 				                       // 1. termination condition and also,
 				                       // 2. for the last cells, closer robots attemp to visit them
 	            // evaluates fitness for every cell on the grid
-				for (int r = 0; r < 4; r++)
+				for (int r = 0; r < 4; r++) // TODO: param
 				{
-					for (int c = 0; c < 11; c++)
+					for (int c = 0; c < 11; c++) // TODO: param
 					{
+						// skip obstacle cells entirely
+						if (obstacles_map[r][c] >= 1.0f) {
+						    continue;
+						}
 						// if cell r,c is unvisited, mark it
 						if (visits_map[r][c] < 1)
 							unvisited += 1;
-						// TODO: SCE coefficinets must be config parameters and not hard coded!
+						// TODO: param - SCE coefficinets must be config parameters and not hard coded!
 						// A = 1/(visits + penalties)
 						// Ar = (1/A)
-						Ar = fpow_simple(visits_map[r][c] + penalties_map[r][c] + 1, 10); // Ar^kappa
+						Ar = fpow_simple(visits_map[r][c] + penalties_map[r][c], 8) + 1.0f; // Ar^kappa
 						// center of the cell
-						cx = c * 0.15f + 0.15f;
-						cy = r * 0.15f + 0.15f;
+						cx = c * 0.15f + 0.15f; // + 0.15 => 0.75f (half cell) + 0.75f (safety not to cover the marker)
+						cy = r * 0.15f + 0.15f; // + 0.15 => 0.75f (half cell) + 0.75f (safety not to cover the marker)
 						dist = dist_to_target(x, y, cx, cy); // direct distance
-						if (dist < 0.075f) // TODO: make 0.075 (half cell size) a confid parameter
+						angle = desired_theta_to_target(x, y, th, cx, cy);
+						if (dist < 0.075f) // TODO: param - make 0.075 (half cell size) a confid parameter
 							continue; // avoid singularity and too close cells
-						D = fpow_simple(dist, 2); // D^mu
+						D = fpow_simple(dist, 4); // D^mu
+						R = 1+2.0f*fabsf(angle); // add angle difference penalty, TODO: param - make the weight of angle penalty a config parameter
 						Dbar = 1;
 						int closer_bots = 0;
 						for (int i = 0; i < n_other_robots; i++)
@@ -1096,15 +1448,15 @@ void handle_command(void)
 							if (dist_to_other_robot < dist)
 								closer_bots++;
 						}
-						Dbar = fpow_simple(Dbar, 2); // Dbar^lambda
-						fitness = Dbar / (Ar*D); // F = A^kappa * Dbar^mu / D^lambda = Dbar^mu / (Ar^kappa * D^mu)
-						if (fitness>fittest && dist>=0.075f) //TODO: make 0.075 (half cell size) a confid parameter
+						Dbar = fpow_simple(Dbar, 4); // Dbar^lambda
+						fitness = (Dbar*R) / (Ar*D); // F = A^kappa * Dbar^mu / D^lambda = Dbar^mu / (Ar^kappa * D^mu)
+						if (fitness>fittest && dist>=0.075f) //TODO: param -make 0.075 (half cell size) a confid parameter
 						{
 							// cell can be selected if it is NOT too close
 							fittest = fitness; // candidate this cell as the best cell so far (inc. its properties)
 							closer_bots_f = closer_bots;
-							best_x = cx;
-							best_y = cy;
+//							best_x = cx;
+//							best_y = cy;
 							// index of the best cell for penalties (global)
 							xt_i = c;
 							yt_i = r;
@@ -1116,16 +1468,28 @@ void handle_command(void)
 				// this robot should avoid moving if it is not the closest bot to the unvisited target cell
 				if (unvisited < (n_other_robots+1) && closer_bots_f>0)
 					fittest = -1;
+				if (obstacles_map[yt_i][xt_i] >= 1.0f)
+				    fittest = -1;
 				// fitness may not be -1 (no cell is celected, or the selected cell was not valid)
 				if (fittest > 0)
 				{
-					// store cell position globally
-					xt = best_x;
-					yt = best_y;
-					// stop the motors
-					Motors_Stop(&motors);
-					// initialize the gotoXY algorithm
-					goto_state = GOTO_ROTATE;
+					// current robot cell
+					int sc = round_nearest((x - X0) / CELL);
+					int sr = round_nearest((y - Y0) / CELL);
+					if (sc < 0) sc = 0;
+					if (sc >= COLS) sc = COLS - 1;
+					if (sr < 0) sr = 0;
+					if (sr >= ROWS) sr = ROWS - 1;
+
+					// plan
+					if (!astar_plan_cells(sr, sc, yt_i, xt_i)) {
+					    penalize_target_cell();
+					    fittest = -1; // force reselect next cycle
+					} else {
+					    cell_center(path_r[0], path_c[0], &xt, &yt);
+					    Motors_Stop(&motors);
+					    goto_state = GOTO_ROTATE;
+					}
 				}
 
 				// check the termination condition
@@ -1278,46 +1642,46 @@ void broadcast_pos(void)
 /* USER CODE END 0 */
 
 /**
- * @brief  The application entry point.
- * @retval int
- */
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
 
-	/* USER CODE BEGIN 1 */
+  /* USER CODE BEGIN 1 */
 
-	/* USER CODE END 1 */
+  /* USER CODE END 1 */
 
-	/* MCU Configuration--------------------------------------------------------*/
+  /* MCU Configuration--------------------------------------------------------*/
 
-	/* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-	HAL_Init();
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
 
-	/* USER CODE BEGIN Init */
+  /* USER CODE BEGIN Init */
 
-	/* USER CODE END Init */
+  /* USER CODE END Init */
 
-	/* Configure the system clock */
-	SystemClock_Config();
+  /* Configure the system clock */
+  SystemClock_Config();
 
-	/* USER CODE BEGIN SysInit */
+  /* USER CODE BEGIN SysInit */
 
-	/* USER CODE END SysInit */
+  /* USER CODE END SysInit */
 
-	/* Initialize all configured peripherals */
-	MX_GPIO_Init();
-	MX_DMA_Init();
-	MX_TIM3_Init();
-	MX_TIM4_Init();
-	MX_TIM2_Init();
-	MX_I2C1_Init();
-	MX_TIM5_Init();
-	MX_USART1_UART_Init();
-	MX_USART2_UART_Init();
-	MX_ADC1_Init();
-	MX_TIM9_Init();
-	MX_TIM10_Init();
-	/* USER CODE BEGIN 2 */
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_TIM3_Init();
+  MX_TIM4_Init();
+  MX_TIM2_Init();
+  MX_I2C1_Init();
+  MX_TIM5_Init();
+  MX_USART1_UART_Init();
+  MX_USART2_UART_Init();
+  MX_ADC1_Init();
+  MX_TIM9_Init();
+  MX_TIM10_Init();
+  /* USER CODE BEGIN 2 */
 	// PWM Timers for motors
 	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); // PWM motor right
 	HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1); // PWM motor left
@@ -1338,10 +1702,10 @@ int main(void)
 
 	rec_init(); // init recovery window for broadcasts
 
-	/* USER CODE END 2 */
+  /* USER CODE END 2 */
 
-	/* Infinite loop */
-	/* USER CODE BEGIN WHILE */
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
 	while (1)
 	{
 		uint32_t odom_n = 0, cam_n = 0, broadcastPOS_n = 0;
@@ -1365,6 +1729,7 @@ int main(void)
 		if (broadcastPOS_n)
 		{
 			broadcast_pos();
+			debug_send_state();
 		}
 
 		// receive and parse commands if cmdReady flag is set
@@ -1378,523 +1743,523 @@ int main(void)
 		// handle commands
 		handle_command();
 
-		/* USER CODE END WHILE */
+    /* USER CODE END WHILE */
 
-		/* USER CODE BEGIN 3 */
+    /* USER CODE BEGIN 3 */
 	}
-	/* USER CODE END 3 */
+  /* USER CODE END 3 */
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- */
+  * @brief System Clock Configuration
+  * @retval None
+  */
 void SystemClock_Config(void)
 {
-	RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-	RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-	/** Configure the main internal regulator output voltage
-	 */
-	__HAL_RCC_PWR_CLK_ENABLE();
-	__HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
 
-	/** Initializes the RCC Oscillators according to the specified parameters
-	 * in the RCC_OscInitTypeDef structure.
-	 */
-	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-	RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-	RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-	RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-	RCC_OscInitStruct.PLL.PLLM = 25;
-	RCC_OscInitStruct.PLL.PLLN = 168;
-	RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-	RCC_OscInitStruct.PLL.PLLQ = 4;
-	if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-	{
-		Error_Handler();
-	}
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 25;
+  RCC_OscInitStruct.PLL.PLLN = 168;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
-	/** Initializes the CPU, AHB and APB buses clocks
-	 */
-	RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-			|RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-	RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-	RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-	RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-	RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-	if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
-	{
-		Error_Handler();
-	}
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 /**
- * @brief ADC1 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_ADC1_Init(void)
 {
 
-	/* USER CODE BEGIN ADC1_Init 0 */
+  /* USER CODE BEGIN ADC1_Init 0 */
 
-	/* USER CODE END ADC1_Init 0 */
+  /* USER CODE END ADC1_Init 0 */
 
-	ADC_ChannelConfTypeDef sConfig = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
 
-	/* USER CODE BEGIN ADC1_Init 1 */
+  /* USER CODE BEGIN ADC1_Init 1 */
 
-	/* USER CODE END ADC1_Init 1 */
+  /* USER CODE END ADC1_Init 1 */
 
-	/** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
-	 */
-	hadc1.Instance = ADC1;
-	hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
-	hadc1.Init.Resolution = ADC_RESOLUTION_12B;
-	hadc1.Init.ScanConvMode = DISABLE;
-	hadc1.Init.ContinuousConvMode = ENABLE;
-	hadc1.Init.DiscontinuousConvMode = DISABLE;
-	hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-	hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-	hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-	hadc1.Init.NbrOfConversion = 1;
-	hadc1.Init.DMAContinuousRequests = ENABLE;
-	hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
-	if (HAL_ADC_Init(&hadc1) != HAL_OK)
-	{
-		Error_Handler();
-	}
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
-	/** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
-	 */
-	sConfig.Channel = ADC_CHANNEL_8;
-	sConfig.Rank = 1;
-	sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
-	if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN ADC1_Init 2 */
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_8;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
 
-	/* USER CODE END ADC1_Init 2 */
+  /* USER CODE END ADC1_Init 2 */
 
 }
 
 /**
- * @brief I2C1 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_I2C1_Init(void)
 {
 
-	/* USER CODE BEGIN I2C1_Init 0 */
+  /* USER CODE BEGIN I2C1_Init 0 */
 
-	/* USER CODE END I2C1_Init 0 */
+  /* USER CODE END I2C1_Init 0 */
 
-	/* USER CODE BEGIN I2C1_Init 1 */
+  /* USER CODE BEGIN I2C1_Init 1 */
 
-	/* USER CODE END I2C1_Init 1 */
-	hi2c1.Instance = I2C1;
-	hi2c1.Init.ClockSpeed = 100000;
-	hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
-	hi2c1.Init.OwnAddress1 = 0;
-	hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-	hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-	hi2c1.Init.OwnAddress2 = 0;
-	hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-	hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-	if (HAL_I2C_Init(&hi2c1) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN I2C1_Init 2 */
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
 
-	/* USER CODE END I2C1_Init 2 */
+  /* USER CODE END I2C1_Init 2 */
 
 }
 
 /**
- * @brief TIM2 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_TIM2_Init(void)
 {
 
-	/* USER CODE BEGIN TIM2_Init 0 */
+  /* USER CODE BEGIN TIM2_Init 0 */
 
-	/* USER CODE END TIM2_Init 0 */
+  /* USER CODE END TIM2_Init 0 */
 
-	TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-	TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-	/* USER CODE BEGIN TIM2_Init 1 */
+  /* USER CODE BEGIN TIM2_Init 1 */
 
-	/* USER CODE END TIM2_Init 1 */
-	htim2.Instance = TIM2;
-	htim2.Init.Prescaler = 8399;
-	htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-	htim2.Init.Period = 99;
-	htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-	htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-	if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-	if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-	if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN TIM2_Init 2 */
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 8399;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 99;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
 
-	/* USER CODE END TIM2_Init 2 */
+  /* USER CODE END TIM2_Init 2 */
 
 }
 
 /**
- * @brief TIM3 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_TIM3_Init(void)
 {
 
-	/* USER CODE BEGIN TIM3_Init 0 */
+  /* USER CODE BEGIN TIM3_Init 0 */
 
-	/* USER CODE END TIM3_Init 0 */
+  /* USER CODE END TIM3_Init 0 */
 
-	TIM_MasterConfigTypeDef sMasterConfig = {0};
-	TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
 
-	/* USER CODE BEGIN TIM3_Init 1 */
+  /* USER CODE BEGIN TIM3_Init 1 */
 
-	/* USER CODE END TIM3_Init 1 */
-	htim3.Instance = TIM3;
-	htim3.Init.Prescaler = 83;
-	htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-	htim3.Init.Period = 19999;
-	htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-	htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-	if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-	if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	sConfigOC.OCMode = TIM_OCMODE_PWM1;
-	sConfigOC.Pulse = 0;
-	sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-	sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-	if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN TIM3_Init 2 */
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 83;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 19999;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
 
-	/* USER CODE END TIM3_Init 2 */
-	HAL_TIM_MspPostInit(&htim3);
+  /* USER CODE END TIM3_Init 2 */
+  HAL_TIM_MspPostInit(&htim3);
 
 }
 
 /**
- * @brief TIM4 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief TIM4 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_TIM4_Init(void)
 {
 
-	/* USER CODE BEGIN TIM4_Init 0 */
+  /* USER CODE BEGIN TIM4_Init 0 */
 
-	/* USER CODE END TIM4_Init 0 */
+  /* USER CODE END TIM4_Init 0 */
 
-	TIM_MasterConfigTypeDef sMasterConfig = {0};
-	TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
 
-	/* USER CODE BEGIN TIM4_Init 1 */
+  /* USER CODE BEGIN TIM4_Init 1 */
 
-	/* USER CODE END TIM4_Init 1 */
-	htim4.Instance = TIM4;
-	htim4.Init.Prescaler = 83;
-	htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-	htim4.Init.Period = 19999;
-	htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-	htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-	if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-	if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	sConfigOC.OCMode = TIM_OCMODE_PWM1;
-	sConfigOC.Pulse = 0;
-	sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-	sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-	if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN TIM4_Init 2 */
+  /* USER CODE END TIM4_Init 1 */
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 83;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 19999;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM4_Init 2 */
 
-	/* USER CODE END TIM4_Init 2 */
-	HAL_TIM_MspPostInit(&htim4);
+  /* USER CODE END TIM4_Init 2 */
+  HAL_TIM_MspPostInit(&htim4);
 
 }
 
 /**
- * @brief TIM5 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief TIM5 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_TIM5_Init(void)
 {
 
-	/* USER CODE BEGIN TIM5_Init 0 */
+  /* USER CODE BEGIN TIM5_Init 0 */
 
-	/* USER CODE END TIM5_Init 0 */
+  /* USER CODE END TIM5_Init 0 */
 
-	TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-	TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-	/* USER CODE BEGIN TIM5_Init 1 */
+  /* USER CODE BEGIN TIM5_Init 1 */
 
-	/* USER CODE END TIM5_Init 1 */
-	htim5.Instance = TIM5;
-	htim5.Init.Prescaler = 8399;
-	htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
-	htim5.Init.Period = 4;
-	htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-	htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-	if (HAL_TIM_Base_Init(&htim5) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-	if (HAL_TIM_ConfigClockSource(&htim5, &sClockSourceConfig) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-	if (HAL_TIMEx_MasterConfigSynchronization(&htim5, &sMasterConfig) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN TIM5_Init 2 */
+  /* USER CODE END TIM5_Init 1 */
+  htim5.Instance = TIM5;
+  htim5.Init.Prescaler = 8399;
+  htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim5.Init.Period = 99;
+  htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim5, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim5, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM5_Init 2 */
 
-	/* USER CODE END TIM5_Init 2 */
+  /* USER CODE END TIM5_Init 2 */
 
 }
 
 /**
- * @brief TIM9 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief TIM9 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_TIM9_Init(void)
 {
 
-	/* USER CODE BEGIN TIM9_Init 0 */
+  /* USER CODE BEGIN TIM9_Init 0 */
 
-	/* USER CODE END TIM9_Init 0 */
+  /* USER CODE END TIM9_Init 0 */
 
-	TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
 
-	/* USER CODE BEGIN TIM9_Init 1 */
+  /* USER CODE BEGIN TIM9_Init 1 */
 
-	/* USER CODE END TIM9_Init 1 */
-	htim9.Instance = TIM9;
-	htim9.Init.Prescaler = 83;
-	htim9.Init.CounterMode = TIM_COUNTERMODE_UP;
-	htim9.Init.Period = 499;
-	htim9.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-	htim9.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-	if (HAL_TIM_Base_Init(&htim9) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-	if (HAL_TIM_ConfigClockSource(&htim9, &sClockSourceConfig) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN TIM9_Init 2 */
+  /* USER CODE END TIM9_Init 1 */
+  htim9.Instance = TIM9;
+  htim9.Init.Prescaler = 83;
+  htim9.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim9.Init.Period = 499;
+  htim9.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim9.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim9) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim9, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM9_Init 2 */
 
-	/* USER CODE END TIM9_Init 2 */
+  /* USER CODE END TIM9_Init 2 */
 
 }
 
 /**
- * @brief TIM10 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief TIM10 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_TIM10_Init(void)
 {
 
-	/* USER CODE BEGIN TIM10_Init 0 */
+  /* USER CODE BEGIN TIM10_Init 0 */
 
-	/* USER CODE END TIM10_Init 0 */
+  /* USER CODE END TIM10_Init 0 */
 
-	/* USER CODE BEGIN TIM10_Init 1 */
+  /* USER CODE BEGIN TIM10_Init 1 */
 
-	/* USER CODE END TIM10_Init 1 */
-	htim10.Instance = TIM10;
-	htim10.Init.Prescaler = 8399;
-	htim10.Init.CounterMode = TIM_COUNTERMODE_UP;
-	htim10.Init.Period = 99;
-	htim10.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-	htim10.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-	if (HAL_TIM_Base_Init(&htim10) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN TIM10_Init 2 */
+  /* USER CODE END TIM10_Init 1 */
+  htim10.Instance = TIM10;
+  htim10.Init.Prescaler = 8399;
+  htim10.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim10.Init.Period = 99;
+  htim10.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim10.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim10) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM10_Init 2 */
 
-	/* USER CODE END TIM10_Init 2 */
+  /* USER CODE END TIM10_Init 2 */
 
 }
 
 /**
- * @brief USART1 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_USART1_UART_Init(void)
 {
 
-	/* USER CODE BEGIN USART1_Init 0 */
+  /* USER CODE BEGIN USART1_Init 0 */
 
-	/* USER CODE END USART1_Init 0 */
+  /* USER CODE END USART1_Init 0 */
 
-	/* USER CODE BEGIN USART1_Init 1 */
+  /* USER CODE BEGIN USART1_Init 1 */
 
-	/* USER CODE END USART1_Init 1 */
-	huart1.Instance = USART1;
-	huart1.Init.BaudRate = 115200;
-	huart1.Init.WordLength = UART_WORDLENGTH_8B;
-	huart1.Init.StopBits = UART_STOPBITS_1;
-	huart1.Init.Parity = UART_PARITY_NONE;
-	huart1.Init.Mode = UART_MODE_TX_RX;
-	huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-	huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-	if (HAL_UART_Init(&huart1) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN USART1_Init 2 */
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
 
-	/* USER CODE END USART1_Init 2 */
+  /* USER CODE END USART1_Init 2 */
 
 }
 
 /**
- * @brief USART2 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_USART2_UART_Init(void)
 {
 
-	/* USER CODE BEGIN USART2_Init 0 */
+  /* USER CODE BEGIN USART2_Init 0 */
 
-	/* USER CODE END USART2_Init 0 */
+  /* USER CODE END USART2_Init 0 */
 
-	/* USER CODE BEGIN USART2_Init 1 */
+  /* USER CODE BEGIN USART2_Init 1 */
 
-	/* USER CODE END USART2_Init 1 */
-	huart2.Instance = USART2;
-	huart2.Init.BaudRate = 115200;
-	huart2.Init.WordLength = UART_WORDLENGTH_8B;
-	huart2.Init.StopBits = UART_STOPBITS_1;
-	huart2.Init.Parity = UART_PARITY_NONE;
-	huart2.Init.Mode = UART_MODE_TX_RX;
-	huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-	huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-	if (HAL_UART_Init(&huart2) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN USART2_Init 2 */
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
 
-	/* USER CODE END USART2_Init 2 */
+  /* USER CODE END USART2_Init 2 */
 
 }
 
 /**
- * Enable DMA controller clock
- */
+  * Enable DMA controller clock
+  */
 static void MX_DMA_Init(void)
 {
 
-	/* DMA controller clock enable */
-	__HAL_RCC_DMA2_CLK_ENABLE();
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
 
-	/* DMA interrupt init */
-	/* DMA2_Stream0_IRQn interrupt configuration */
-	HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
-	HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+  /* DMA interrupt init */
+  /* DMA2_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 
 }
 
 /**
- * @brief GPIO Initialization Function
- * @param None
- * @retval None
- */
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_GPIO_Init(void)
 {
-	GPIO_InitTypeDef GPIO_InitStruct = {0};
-	/* USER CODE BEGIN MX_GPIO_Init_1 */
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
 
-	/* USER CODE END MX_GPIO_Init_1 */
+  /* USER CODE END MX_GPIO_Init_1 */
 
-	/* GPIO Ports Clock Enable */
-	__HAL_RCC_GPIOH_CLK_ENABLE();
-	__HAL_RCC_GPIOA_CLK_ENABLE();
-	__HAL_RCC_GPIOB_CLK_ENABLE();
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
-	/*Configure GPIO pin Output Level */
-	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1|GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5, GPIO_PIN_RESET);
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1|GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5, GPIO_PIN_RESET);
 
-	/*Configure GPIO pins : PA5 PA7 */
-	GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_7;
-	GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-	GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  /*Configure GPIO pins : PA5 PA7 */
+  GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-	/*Configure GPIO pins : PB1 PB3 PB4 PB5 */
-	GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5;
-	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  /*Configure GPIO pins : PB1 PB3 PB4 PB5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-	/* EXTI interrupt init*/
-	HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
-	HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 
-	/* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
 
-	/* USER CODE END MX_GPIO_Init_2 */
+  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -1902,33 +2267,32 @@ static void MX_GPIO_Init(void)
 /* USER CODE END 4 */
 
 /**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
 void Error_Handler(void)
 {
-	/* USER CODE BEGIN Error_Handler_Debug */
+  /* USER CODE BEGIN Error_Handler_Debug */
 	/* User can add his own implementation to report the HAL error return state */
 	__disable_irq();
 	while (1)
 	{
 	}
-	/* USER CODE END Error_Handler_Debug */
+  /* USER CODE END Error_Handler_Debug */
 }
 #ifdef USE_FULL_ASSERT
 /**
- * @brief  Reports the name of the source file and the source line number
- *         where the assert_param error has occurred.
- * @param  file: pointer to the source file name
- * @param  line: assert_param error line source number
- * @retval None
- */
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-	/* USER CODE BEGIN 6 */
+  /* USER CODE BEGIN 6 */
 	/* User can add his own implementation to report the file name and line number,
      ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-	/* USER CODE END 6 */
+  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
-
