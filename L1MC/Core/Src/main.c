@@ -116,7 +116,7 @@ int path_idx = 0;
 #define MAX_VISIT_AND_PENALTY_COUNT 1000.0f
 
 // inter-swarm communication
-#define MID 16                                                    // Mechalino ID (MID)
+#define MID 15                                                    // Mechalino ID (MID)
 #define MAX_OTHER_ROBOTS 4                                        // max number of others (Maximum Swarm Size=5)
 #define INVALID_MID 222
 
@@ -127,10 +127,10 @@ int path_idx = 0;
 #define OBSTACLE_DIST_M       0.15f
 #define OBSTACLE_MARK_R       0.075f
 
-#define OBSTACLE_TH_MV        1500u                                // general
-#define OBSTACLE_TH0_MV       1000u                                // front
-#define OBSTACLE_TH1_MV       1000u                               // front-right
-#define OBSTACLE_TH2_MV       1000u                               // front-left
+#define OBSTACLE_TH_MV        1400u                                // general
+#define OBSTACLE_TH0_MV       1400u                                // front
+#define OBSTACLE_TH1_MV       1400u                               // front-right
+#define OBSTACLE_TH2_MV       1400u                               // front-left
 
 #define DEG2RAD(x) ((x) * (float)M_PI / 180.0f)
 
@@ -328,7 +328,7 @@ void debug_send_state(void)
     __disable_irq();
     adc0 = adc_readings[0];
     adc1 = adc_readings[1];
-    adc2 = adc_readings[2];
+    adc2 = adc_readings[7];
     __set_PRIMASK(primask);
 
     len += snprintf(tx + len, sizeof(tx) - len, "DEBUG#V:");
@@ -657,11 +657,33 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 		HAL_ADC_Stop_DMA(&hadc1);
 
 		// Calculate average
-		uint32_t sum = 0;
-		for(int i = 0; i < IRD_NUM_SAMPLES; i++) {
-			sum += adc_buffer[i];
+//		uint32_t sum = 0;
+//		for(int i = 0; i < IRD_NUM_SAMPLES; i++) {
+//			sum += adc_buffer[i];
+//		}
+//		float miliVolts = (sum * 3300.0f) / (IRD_NUM_SAMPLES * 4095.0f);
+
+		// Median
+		uint16_t samples[IRD_NUM_SAMPLES];
+
+		for (int i = 0; i < IRD_NUM_SAMPLES; i++)
+		    samples[i] = adc_buffer[i];
+
+		for (int i = 1; i < IRD_NUM_SAMPLES; i++) {
+		    uint16_t key = samples[i];
+		    int j = i - 1;
+
+		    while (j >= 0 && samples[j] > key) {
+		        samples[j + 1] = samples[j];
+		        j--;
+		    }
+
+		    samples[j + 1] = key;
 		}
-		float miliVolts = (sum * 3300.0f) / (IRD_NUM_SAMPLES * 4095.0f);
+
+		uint16_t adc_median = samples[IRD_NUM_SAMPLES / 2];
+
+		float miliVolts = adc_median * 3300.0f / 4095.0f;
 
 		// Store the reading based on current step
 		if(current_step == 0)  // Step 0: DMUX disabled (OFF reading)
@@ -1200,11 +1222,11 @@ static inline int obstacle_in_front(void)
 	__disable_irq();
 	s0 = adc_readings[0];   // front
 	s1 = adc_readings[1];   // front-right
-	s2 = adc_readings[2];   // front-left
+	s2 = adc_readings[7];   // front-left
 	__set_PRIMASK(primask);
 
 	// no obstacle
-	if (s0 <= OBSTACLE_TH0_MV && s1 <= OBSTACLE_TH1_MV && s2 <= OBSTACLE_TH2_MV) {
+	if (s0 <= OBSTACLE_TH_MV && s1 <= OBSTACLE_TH_MV && s2 <= OBSTACLE_TH_MV) {
 		return 0;
 	}
 
@@ -1279,7 +1301,7 @@ void gotoXY()
 			__disable_irq();
 			s0 = adc_readings[0];   // front
 			s1 = adc_readings[1];   // +45°
-			s2 = adc_readings[2];   // -45°
+			s2 = adc_readings[7];   // -45°
 			__set_PRIMASK(primask);
 		}
 		// get max of sensor values
@@ -1321,18 +1343,14 @@ void gotoXY()
 				obstacles_map[oc_r][oc_c] = 1.0f; // mark cell as occupied
 				if (visits_map[oc_r][oc_c] == 0)
 				{
-					discount_penalties();
+					penalize_target_cell();
 					// update recovey window
 					rec_push_cell(oc_r, oc_c);
 				}
 				visits_map[oc_r][oc_c] = 1000.0f; // mark cell as visited to avoid it in the future
 			}
-			else
-			{
-				penalize_target_cell(); // if the projected obstacle is out of bounds or on the current cell, just penalize the target cell to avoid it in the future
-			}
 			Motors_SetPWM(&motors, MOTOR_PWM_MAX_BACKWARD, MOTOR_PWM_MAX_FORWARD);
-			HAL_Delay(600); // TODO: param
+			HAL_Delay(800); // TODO: param
 			Motors_Stop(&motors);
 			goto_state = GOTO_DONE; // stop and wait for next command to replan, because the current path is now invalid
 			return; // important: don’t continue the old drive logic after replanning
@@ -1410,7 +1428,7 @@ void handle_command(void)
 //				float best_x, best_y; //local var for best cell coordinates
 				int closer_bots_f = 0; // number of other_robots that are closer to the potential best cell
 				float fittest = -1; // fitness value to be maximised, initially -1
-				float Ar, R, D, Dbar,fitness,dist,angle,cx,cy; // Ar = A reverse, D = distance to self, Dbar = distance to other robots
+				float Ar, R, D, Dbar,fitness,dist,heading_error,cx,cy; // Ar = A reverse, D = distance to self, Dbar = distance to other robots
 				uint8_t unvisited = 0; // number of unvisited cells, important for both:
 				                       // 1. termination condition and also,
 				                       // 2. for the last cells, closer robots attemp to visit them
@@ -1434,11 +1452,12 @@ void handle_command(void)
 						cx = c * 0.15f + 0.15f; // + 0.15 => 0.75f (half cell) + 0.75f (safety not to cover the marker)
 						cy = r * 0.15f + 0.15f; // + 0.15 => 0.75f (half cell) + 0.75f (safety not to cover the marker)
 						dist = dist_to_target(x, y, cx, cy); // direct distance
-						angle = desired_theta_to_target(x, y, th, cx, cy);
+//						angle = desired_theta_to_target(x, y, th, cx, cy);
 						if (dist < 0.075f) // TODO: param - make 0.075 (half cell size) a confid parameter
 							continue; // avoid singularity and too close cells
 						D = fpow_simple(dist, 4); // D^mu
-						R = 1+2.0f*fabsf(angle); // add angle difference penalty, TODO: param - make the weight of angle penalty a config parameter
+						heading_error = heading_error_to_target(x, y, th, cx, cy);
+						R = 1+4*fabsf(heading_error)/M_PI; // add angle difference penalty, TODO: param - make the weight of angle penalty a config parameter
 						Dbar = 1;
 						int closer_bots = 0;
 						for (int i = 0; i < n_other_robots; i++)
@@ -1449,7 +1468,7 @@ void handle_command(void)
 								closer_bots++;
 						}
 						Dbar = fpow_simple(Dbar, 4); // Dbar^lambda
-						fitness = (Dbar*R) / (Ar*D); // F = A^kappa * Dbar^mu / D^lambda = Dbar^mu / (Ar^kappa * D^mu)
+						fitness = Dbar / (Ar*D*R); // F = A^kappa * Dbar^mu / D^lambda = Dbar^mu / (Ar^kappa * D^mu)
 						if (fitness>fittest && dist>=0.075f) //TODO: param -make 0.075 (half cell size) a confid parameter
 						{
 							// cell can be selected if it is NOT too close
