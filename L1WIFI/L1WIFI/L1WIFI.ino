@@ -1,10 +1,11 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <WiFiClient.h>
+#include <stdlib.h>
 
 const char* ssid = "MechalinoAP";
 const char* password = "12345679";
-const int Mechalino_ID = 15;
+const int Mechalino_ID = 17;
 
 ESP8266WebServer server(80);
 
@@ -293,20 +294,25 @@ void loop() {
   }
 
   /* ---------- UDP RX ---------- */
-  static uint32_t last_opos_fwd = 0;
-  int pkt_len = udp.parsePacket();
-  if (pkt_len > 0) {
+  int pkt_len;
+  while ((pkt_len = udp.parsePacket()) > 0) {
       if (pkt_len >= (int)sizeof(udp_rx_buf))
           pkt_len = sizeof(udp_rx_buf) - 1;
 
       udp.read(udp_rx_buf, pkt_len);
       udp_rx_buf[pkt_len] = '\0';
 
-      if (millis() - last_opos_fwd > 500) { // max 2 Hz forwarding
-        last_opos_fwd = millis();
-        Serial.print("OPOS#");
-        Serial.println(udp_rx_buf);
-      }
+      // Payload starts with "<robot-id>#". Never send our own broadcast
+      // back to the STM32, where it would consume an other-robot slot.
+      char *id_end = nullptr;
+      long sender_id = strtol(udp_rx_buf, &id_end, 10);
+      if (id_end == udp_rx_buf || *id_end != '#' || sender_id == Mechalino_ID)
+          continue;
+
+      // Forward every peer packet. A global time gate loses all but one packet
+      // when several robots make their periodic broadcasts at the same time.
+      Serial.print("OPOS#");
+      Serial.println(udp_rx_buf);
   }
   yield();
 }

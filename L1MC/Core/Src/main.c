@@ -116,21 +116,20 @@ int path_idx = 0;
 #define MAX_VISIT_AND_PENALTY_COUNT 1000.0f
 
 // inter-swarm communication
-#define MID 15                                                    // Mechalino ID (MID)
-#define MAX_OTHER_ROBOTS 4                                        // max number of others (Maximum Swarm Size=5)
+#define MID 18                                                    // Mechalino ID (MID)
+#define MAX_OTHER_ROBOTS 10                                        // max number of others (Maximum Swarm Size=5)
 #define INVALID_MID 222
-
-// recovery window for broadcasts
-#define REC_WINDOW 5
+#define OPOS_QUEUE_DEPTH 8                                        // absorbs a full swarm broadcast burst
+#define OPOS_MESSAGE_SIZE 128                                     // M1 packets are below 80 bytes
 
 // obstacle avoidance params
 #define OBSTACLE_DIST_M       0.15f
 #define OBSTACLE_MARK_R       0.075f
 
-#define OBSTACLE_TH_MV        1400u                                // general
-#define OBSTACLE_TH0_MV       1400u                                // front
-#define OBSTACLE_TH1_MV       1400u                               // front-right
-#define OBSTACLE_TH2_MV       1400u                               // front-left
+#define OBSTACLE_TH_MV        2500u                                // general
+#define OBSTACLE_TH0_MV       2500u                                // front
+#define OBSTACLE_TH1_MV       2500u                               // front-right
+#define OBSTACLE_TH2_MV       2500u                               // front-left
 
 #define DEG2RAD(x) ((x) * (float)M_PI / 180.0f)
 
@@ -181,7 +180,6 @@ uint8_t rxByte;
 char rxBuffer[256];
 uint8_t rxIndex = 0;
 volatile uint8_t posReady = 0;
-volatile uint8_t oposReady = 0;
 volatile uint8_t cmdReady  = 0;
 char cmdBuffer[256];
 char posBuffer[256];
@@ -219,14 +217,14 @@ uint8_t obs_hits = 0;
 #define OBS_HITS_N  3   // require 3 consecutive detections
 
 // inter swarm communication
-char oposBuffer[256];
 float other_robots[MAX_OTHER_ROBOTS][2];
 uint8_t other_robots_ids[MAX_OTHER_ROBOTS] = {0};
 uint8_t n_other_robots = 0;
-
-// recovery window for broadcasts
-static int16_t rec_cells[REC_WINDOW][2];  // [i][0]=r, [i][1]=c
-static uint8_t rec_head = 0;
+static char opos_queue[OPOS_QUEUE_DEPTH][OPOS_MESSAGE_SIZE];
+static volatile uint8_t opos_q_head = 0;
+static volatile uint8_t opos_q_tail = 0;
+static volatile uint8_t opos_q_count = 0;
+static volatile uint32_t opos_drop_count = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -269,9 +267,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc);
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
 void parse_command_if_ready(void);
 
-/* --- SCE memory / recovery window --- */
-static void   rec_init(void);
-static void   rec_push_cell(int r, int c);
+/* --- SCE memory --- */
 static inline int round_nearest(float v);
 
 void  penalize_target_cell(void);
@@ -757,11 +753,17 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 			}
 			else if (strncmp(rxBuffer, "OPOS#", 5) == 0)
 			{
-				if (!oposReady)
+				if (opos_q_count < OPOS_QUEUE_DEPTH)
 				{
-					strncpy(oposBuffer, rxBuffer, sizeof(oposBuffer));
-					oposBuffer[sizeof(oposBuffer) - 1] = '\0';
-					oposReady = 1;
+					uint8_t slot = opos_q_head;
+					strncpy(opos_queue[slot], rxBuffer, sizeof(opos_queue[slot]));
+					opos_queue[slot][sizeof(opos_queue[slot]) - 1] = '\0';
+					opos_q_head = (uint8_t)((slot + 1u) % OPOS_QUEUE_DEPTH);
+					opos_q_count++;
+				}
+				else
+				{
+					opos_drop_count++;
 				}
 			}
 			rxIndex = 0;
@@ -846,24 +848,6 @@ void parse_command_if_ready(void)
 	}
 }
 
-static void rec_init(void)
-{
-	for (int i = 0; i < REC_WINDOW; i++) {
-		rec_cells[i][0] = -1;
-		rec_cells[i][1] = -1;
-	}
-	rec_head = 0;
-}
-
-static void rec_push_cell(int r, int c)
-{
-	rec_cells[rec_head][0] = (int16_t)r;
-	rec_cells[rec_head][1] = (int16_t)c;
-
-	rec_head++;
-	if (rec_head >= REC_WINDOW) rec_head = 0;
-}
-
 static inline int round_nearest(float v)
 {
 	return (v >= 0.0f) ? (int)(v + 0.5f) : (int)(v - 0.5f);
@@ -899,8 +883,6 @@ void visits_map_update(float x, float y)
 	if (visits_map[r][c] == 0)
 	{
 		discount_penalties();
-		// update recovey window
-		rec_push_cell(r, c);
 	}
 	if (visits_map[r][c] < MAX_VISIT_AND_PENALTY_COUNT)
 		visits_map[r][c] += 1.0f;
@@ -1344,8 +1326,6 @@ void gotoXY()
 				if (visits_map[oc_r][oc_c] == 0)
 				{
 					penalize_target_cell();
-					// update recovey window
-					rec_push_cell(oc_r, oc_c);
 				}
 				visits_map[oc_r][oc_c] = 1000.0f; // mark cell as visited to avoid it in the future
 			}
@@ -1415,12 +1395,8 @@ void handle_command(void)
 			y = robot_y;
 			th = robot_theta;
 			__set_PRIMASK(primask);
-			// mark current place as visited for this robot and other known robots
+			// mark the current place as visited; peer maps arrive in OPOS messages
 			visits_map_update(x, y);
-			for (int i = 0; i < n_other_robots; i++)
-			{
-				visits_map_update(other_robots[i][0], other_robots[i][1]);
-			}
 
 			if (goto_state == GOTO_DONE)
 			{
@@ -1526,39 +1502,82 @@ void handle_command(void)
 	}
 }
 
-// check oposReady flag
-// copies posBuffer to local
-// expects OPOS#id#x#y#[r#c]...
-// if other_robots_ids contains id,
-//     updates other_robots[0] and [1] by ox and oy
-// else
-//     if n_other_robots < MAX_OTHER_ROBOTS
-//         	n_other_robots++;
-//          updates other_robots[0] and [1] by ox and oy
-// then parses the rest of the string in [r#c] format and uodates visits_map
-void handle_opos_if_ready(void)
+static int opos_queue_pop(char *dst, size_t dst_size)
 {
-	if (!oposReady) return;
+	int have_message = 0;
+	uint32_t primask = __get_PRIMASK();
+	__disable_irq();
 
-	char local[256];
-
+	if (opos_q_count > 0)
 	{
-		uint32_t primask = __get_PRIMASK();
-		__disable_irq();
-		oposReady = 0;
-		strncpy(local, oposBuffer, sizeof(local));
-		local[sizeof(local) - 1] = '\0';
-		__set_PRIMASK(primask);
+		uint8_t slot = opos_q_tail;
+		strncpy(dst, opos_queue[slot], dst_size);
+		dst[dst_size - 1] = '\0';
+		opos_q_tail = (uint8_t)((slot + 1u) % OPOS_QUEUE_DEPTH);
+		opos_q_count--;
+		have_message = 1;
 	}
 
-	// Expect: OPOS#id#x#y#[r#c]...
-	// Tokenize by '#'
+	__set_PRIMASK(primask);
+	return have_message;
+}
+
+static int parse_row_mask(const char *token, uint16_t *mask)
+{
+	char *end = NULL;
+	unsigned long value = strtoul(token, &end, 16);
+	unsigned long valid_bits = (1UL << COLS) - 1UL;
+
+	if (end == token || *end != '\0' || value > valid_bits)
+		return 0;
+
+	*mask = (uint16_t)value;
+	return 1;
+}
+
+static void mark_remote_position_visited(float x, float y)
+{
+	int c = round_nearest((x - X0) / CELL);
+	int r = round_nearest((y - Y0) / CELL);
+
+	if (r >= 0 && r < ROWS && c >= 0 && c < COLS &&
+			visits_map[r][c] < MAX_VISIT_AND_PENALTY_COUNT)
+		visits_map[r][c] = MAX_VISIT_AND_PENALTY_COUNT;
+}
+
+static void merge_full_maps(const uint16_t visit_masks[ROWS],
+		const uint16_t obstacle_masks[ROWS])
+{
+	for (int r = 0; r < ROWS; r++)
+	{
+		for (int c = 0; c < COLS; c++)
+		{
+			uint16_t bit = (uint16_t)(1u << c);
+			if ((visit_masks[r] & bit) &&
+					visits_map[r][c] < MAX_VISIT_AND_PENALTY_COUNT)
+				visits_map[r][c] = MAX_VISIT_AND_PENALTY_COUNT;
+			if (obstacle_masks[r] & bit)
+			{
+				obstacles_map[r][c] = 1.0f;
+				visits_map[r][c] = MAX_VISIT_AND_PENALTY_COUNT;
+			}
+		}
+	}
+}
+
+static void handle_opos_line(char *local)
+{
 	char *save = NULL;
 	char *tok = strtok_r(local, "#", &save);
 	if (!tok || strcmp(tok, "OPOS") != 0) return;
 
 	tok = strtok_r(NULL, "#", &save); if (!tok) return;
-	int id = atoi(tok);
+	char *id_end = NULL;
+	long parsed_id = strtol(tok, &id_end, 10);
+	if (id_end == tok || *id_end != '\0' || parsed_id < 0 || parsed_id > 255 ||
+			parsed_id == MID || parsed_id == INVALID_MID)
+		return;
+	uint8_t id = (uint8_t)parsed_id;
 
 	tok = strtok_r(NULL, "#", &save); if (!tok) return;
 	float ox = (float)atof(tok);
@@ -1566,87 +1585,133 @@ void handle_opos_if_ready(void)
 	tok = strtok_r(NULL, "#", &save); if (!tok) return;
 	float oy = (float)atof(tok);
 
-	// update other_robots list (same as your logic)
 	int found = 0;
-	for (int i = 0; i < n_other_robots; i++) {
-		if (other_robots_ids[i] == id) {
+	for (int i = 0; i < n_other_robots; i++)
+	{
+		if (other_robots_ids[i] == id)
+		{
 			other_robots[i][0] = ox;
 			other_robots[i][1] = oy;
 			found = 1;
 			break;
 		}
 	}
-	if (!found && n_other_robots < MAX_OTHER_ROBOTS) {
+	if (!found && n_other_robots < MAX_OTHER_ROBOTS)
+	{
 		other_robots_ids[n_other_robots] = id;
 		other_robots[n_other_robots][0] = ox;
 		other_robots[n_other_robots][1] = oy;
 		n_other_robots++;
 	}
 
-	// Parse remaining tokens as (r,c) pairs
-	while (1) {
-		char *tr = strtok_r(NULL, "#", &save);
-		if (!tr) break;
+	mark_remote_position_visited(ox, oy);
+
+	// M1 carries one visited bitmap and one obstacle bitmap for every grid row.
+	tok = strtok_r(NULL, "#", &save);
+	if (tok && strcmp(tok, "M1") == 0)
+	{
+		uint16_t visit_masks[ROWS];
+		uint16_t obstacle_masks[ROWS];
+
+		tok = strtok_r(NULL, "#", &save);
+		if (!tok || strcmp(tok, "V") != 0) return;
+		for (int r = 0; r < ROWS; r++)
+		{
+			tok = strtok_r(NULL, "#", &save);
+			if (!tok || !parse_row_mask(tok, &visit_masks[r])) return;
+		}
+
+		tok = strtok_r(NULL, "#", &save);
+		if (!tok || strcmp(tok, "O") != 0) return;
+		for (int r = 0; r < ROWS; r++)
+		{
+			tok = strtok_r(NULL, "#", &save);
+			if (!tok || !parse_row_mask(tok, &obstacle_masks[r])) return;
+		}
+
+		merge_full_maps(visit_masks, obstacle_masks);
+		return;
+	}
+
+	// Backward compatibility with legacy OPOS#id#x#y#[r#c]... packets.
+	while (tok)
+	{
+		char *tr = tok;
 		char *tc = strtok_r(NULL, "#", &save);
 		if (!tc) break;
 
-		int r = atoi(tr);
-		int c = atoi(tc);
-		if (r < 0 || r >= ROWS) continue;
-		if (c < 0 || c >= COLS) continue;
-		// do the update directlt here
-		if (visits_map[r][c] < MAX_VISIT_AND_PENALTY_COUNT)
-			visits_map[r][c] += 1.0f;
+		char *r_end = NULL;
+		char *c_end = NULL;
+		long r = strtol(tr, &r_end, 10);
+		long c = strtol(tc, &c_end, 10);
+		if (r_end != tr && *r_end == '\0' && c_end != tc && *c_end == '\0' &&
+				r >= 0 && r < ROWS && c >= 0 && c < COLS &&
+				visits_map[r][c] < MAX_VISIT_AND_PENALTY_COUNT)
+			visits_map[r][c] = MAX_VISIT_AND_PENALTY_COUNT;
+
+		tok = strtok_r(NULL, "#", &save);
 	}
 }
 
-// sends current pos as "BPOS#%d#%.3f#%.3f" to Serial for ESP
-// sends the latest updates on the visits map as "#%d#%d" to Serial
-// ESP will do a UDP broadcast
+// Drain all queued peer messages so a complete multi-robot burst is processed.
+void handle_opos_if_ready(void)
+{
+	char local[OPOS_MESSAGE_SIZE];
+	while (opos_queue_pop(local, sizeof(local)))
+		handle_opos_line(local);
+}
+
+// Sends position plus complete visited/obstacle bitmaps to the ESP for UDP broadcast.
 void broadcast_pos(void)
 {
 	char tx[256];
 	int len = 0;
+	uint16_t visit_masks[ROWS] = {0};
+	uint16_t obstacle_masks[ROWS] = {0};
 
-	// atomic snapshot of pos (if you still want x,y for "current position" use)
 	float x, y;
 	{
 		uint32_t primask = __get_PRIMASK();
 		__disable_irq();
 		x = robot_x;
 		y = robot_y;
-		__set_PRIMASK(primask);
-	}
-
-	// atomic snapshot of recovery cells
-	int16_t snap[REC_WINDOW][2];
-	{
-		uint32_t primask = __get_PRIMASK();
-		__disable_irq();
-		for (int i = 0; i < REC_WINDOW; i++) {
-			snap[i][0] = rec_cells[i][0];
-			snap[i][1] = rec_cells[i][1];
+		for (int r = 0; r < ROWS; r++)
+		{
+			for (int c = 0; c < COLS; c++)
+			{
+				uint16_t bit = (uint16_t)(1u << c);
+				if (visits_map[r][c] >= 1.0f) visit_masks[r] |= bit;
+				if (obstacles_map[r][c] >= 1.0f) obstacle_masks[r] |= bit;
+			}
 		}
 		__set_PRIMASK(primask);
 	}
 
-	// base
-	len = snprintf(tx, sizeof(tx), "BPOS#%d#%.3f#%.3f", MID, x, y);
+	len = snprintf(tx, sizeof(tx), "BPOS#%d#%.3f#%.3f#M1#V", MID, x, y);
 	if (len < 0 || len >= (int)sizeof(tx)) return;
 
-	// order is not important
-	for (int k = 0; k < REC_WINDOW; k++) {
-		int r = snap[k][0];
-		int c = snap[k][1];
-		if (r < 0 || c < 0)
-			break; // skip the rest, this will happen only at the beginning that the window is not full
-
-		int n = snprintf(tx + len, sizeof(tx) - (size_t)len, "#%d#%d", r, c);
-		if (n < 0 || n >= (int)(sizeof(tx) - (size_t)len)) break;
+	for (int r = 0; r < ROWS; r++)
+	{
+		int n = snprintf(tx + len, sizeof(tx) - (size_t)len, "#%03X",
+				(unsigned int)visit_masks[r]);
+		if (n < 0 || n >= (int)(sizeof(tx) - (size_t)len)) return;
 		len += n;
 	}
 
-	// newline
+	{
+		int n = snprintf(tx + len, sizeof(tx) - (size_t)len, "#O");
+		if (n < 0 || n >= (int)(sizeof(tx) - (size_t)len)) return;
+		len += n;
+	}
+
+	for (int r = 0; r < ROWS; r++)
+	{
+		int n = snprintf(tx + len, sizeof(tx) - (size_t)len, "#%03X",
+				(unsigned int)obstacle_masks[r]);
+		if (n < 0 || n >= (int)(sizeof(tx) - (size_t)len)) return;
+		len += n;
+	}
+
 	if (len < (int)sizeof(tx) - 2) {
 		tx[len++] = '\n';
 		tx[len] = '\0';
@@ -1718,8 +1783,6 @@ int main(void)
 
 	// set timer interrupt for odom and cam pos poll
 	HAL_TIM_Base_Start_IT(&htim10);
-
-	rec_init(); // init recovery window for broadcasts
 
   /* USER CODE END 2 */
 
