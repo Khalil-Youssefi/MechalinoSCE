@@ -5,7 +5,7 @@
 
 const char* ssid = "MechalinoAP";
 const char* password = "12345679";
-const int Mechalino_ID = 17;
+const int Mechalino_ID = 18;
 
 ESP8266WebServer server(80);
 
@@ -20,11 +20,9 @@ String serialBuf;
 #include <WiFiUdp.h>
 
 #define UDP_PORT 4242
-#define UDP_TX_PERIOD_MS 200   // 5 Hz
 
 WiFiUDP udp;
 
-static unsigned long udp_last_tx = 0;
 static char udp_rx_buf[256];
 
 String debugRaw = "";
