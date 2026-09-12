@@ -5,7 +5,7 @@
 
 const char* ssid = "MechalinoAP";
 const char* password = "12345679";
-const int Mechalino_ID = 18;
+const int Mechalino_ID = 20;
 
 ESP8266WebServer server(80);
 

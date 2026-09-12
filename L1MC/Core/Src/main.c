@@ -118,11 +118,12 @@ typedef enum {
 #define GOTO_THETA_DRIVE_MAX_RAD (12.0f * (float)M_PI / 180.0f)
 #define GOTO_DIST_OK_M           (0.02f)
 #define INACTIVE_RECHECK_MS       500u
+#define FINAL_CELL_DISTANCE_TIE_M (0.005f)
 
 // grid parameters
 #define CELL   0.15f
-#define X0     0.15f // 0.75f (half cell) + 0.75f (safety not to cover the marker)
-#define Y0     0.15f // 0.75f (half cell) + 0.75f (safety not to cover the marker)
+#define X0     0.18f // center of grid cell (0, 0) in arena coordinates
+#define Y0     0.28f // center of grid cell (0, 0) in arena coordinates
 #define COLS   11
 #define ROWS   4
 
@@ -144,7 +145,7 @@ int path_idx = 0;
 #define SCE_FITNESS_TIE_EPS    1.0e-6f
 
 // inter-swarm communication
-#define MID 17                                                    // Mechalino ID (MID)
+#define MID 20                                                    // Mechalino ID (MID)
 #define MAX_OTHER_ROBOTS 10                                      // maximum tracked peers
 #define INVALID_MID 222
 #define OPOS_QUEUE_DEPTH 64                                      // absorbs simultaneous peer broadcast bursts
@@ -162,6 +163,7 @@ int path_idx = 0;
 #define OBSTACLE_CLEAR_TH1_MV OBSTACLE_SIDE_CLEAR_MV              // front-right release
 #define OBSTACLE_CLEAR_TH2_MV OBSTACLE_SIDE_CLEAR_MV              // front-left release
 #define OBSTACLE_CONFIRM_FRAMES 3u
+#define OBSTACLE_MAP_CONFIRM_MS 100u                              // same static sensor/cell must persist before mapping
 #define OBSTACLE_STATUS_STALE_MS 100u
 #define OBSTACLE_BACKOFF_MS   800u
 
@@ -269,6 +271,10 @@ static obstacle_status_t obstacle_status = {
 };
 static uint8_t obstacle_hit_streak[IR_SENSOR_COUNT] = {0};
 static uint8_t obstacle_clear_streak[IR_SENSOR_COUNT] = {0};
+static int8_t obstacle_map_candidate_r[IR_SENSOR_COUNT] = {-1, -1, -1};
+static int8_t obstacle_map_candidate_c[IR_SENSOR_COUNT] = {-1, -1, -1};
+static uint32_t obstacle_map_candidate_since_ms[IR_SENSOR_COUNT] = {0};
+static uint8_t obstacle_map_ready_mask = 0;
 
 // inter swarm communication
 float other_robots[MAX_OTHER_ROBOTS][2];
@@ -1371,6 +1377,7 @@ static void obstacle_status_update(void)
 	uint8_t previous_detected = obstacle_status.detected_mask;
 	uint8_t previous_robot = obstacle_status.robot_mask;
 	uint8_t previous_static = obstacle_status.static_mask;
+	uint8_t previous_map_ready = obstacle_map_ready_mask;
 	uint8_t raw_mask = 0;
 	uint8_t detected_mask = obstacle_status.detected_mask;
 
@@ -1453,12 +1460,53 @@ static void obstacle_status_update(void)
 			obstacle_status.static_mask |= bit;
 	}
 
+	uint32_t now_ms = HAL_GetTick();
 	obstacle_status.frame_sequence = sequence;
-	obstacle_status.updated_ms = HAL_GetTick();
+	obstacle_status.updated_ms = now_ms;
+
+	// Collision avoidance keeps the fast sensor debounce above, but persistent
+	// mapping is deliberately slower. A candidate must remain classified as
+	// static in the same projected grid cell while driving for the full hold time.
+	// Any sensor clear, peer classification, cell change, or non-driving state
+	// cancels that candidate before it can contaminate the shared map.
+	for (uint32_t i = 0; i < IR_SENSOR_COUNT; i++)
+	{
+		uint8_t bit = (uint8_t)(1u << i);
+		int r = obstacle_status.cell_r[i];
+		int c = obstacle_status.cell_c[i];
+		int valid_static_cell =
+				(goto_state == GOTO_DRIVE || goto_state == GOTO_BACKOFF) &&
+				(obstacle_status.static_mask & bit) != 0 &&
+				r >= 0 && r < ROWS && c >= 0 && c < COLS;
+
+		if (!valid_static_cell)
+		{
+			obstacle_map_candidate_r[i] = -1;
+			obstacle_map_candidate_c[i] = -1;
+			obstacle_map_candidate_since_ms[i] = 0;
+			obstacle_map_ready_mask &= (uint8_t)~bit;
+			continue;
+		}
+
+		if (obstacle_map_candidate_r[i] != r ||
+				obstacle_map_candidate_c[i] != c)
+		{
+			obstacle_map_candidate_r[i] = (int8_t)r;
+			obstacle_map_candidate_c[i] = (int8_t)c;
+			obstacle_map_candidate_since_ms[i] = now_ms;
+			obstacle_map_ready_mask &= (uint8_t)~bit;
+		}
+		else if ((now_ms - obstacle_map_candidate_since_ms[i]) >=
+				OBSTACLE_MAP_CONFIRM_MS)
+		{
+			obstacle_map_ready_mask |= bit;
+		}
+	}
 
 	if (previous_detected != obstacle_status.detected_mask ||
 			previous_robot != obstacle_status.robot_mask ||
-			previous_static != obstacle_status.static_mask)
+			previous_static != obstacle_status.static_mask ||
+			previous_map_ready != obstacle_map_ready_mask)
 		debug_due = 1;
 }
 
@@ -1469,9 +1517,8 @@ static int obstacle_status_is_fresh(uint32_t now_ms)
 }
 
 // Mapping is deliberately separate from continuous classification: sensing can
-// run while idle or rotating, while only navigation commits a static hit to the
-// persistent map. Every confirmed static sensor ray is considered, not just the
-// ray with the largest ADC value.
+// run while idle or rotating, while only a static sensor/cell candidate held for
+// OBSTACLE_MAP_CONFIRM_MS during driving/backoff reaches the persistent map.
 static int mark_cached_static_obstacles(void)
 {
 	int current_r = -1;
@@ -1482,11 +1529,11 @@ static int mark_cached_static_obstacles(void)
 	for (uint32_t i = 0; i < IR_SENSOR_COUNT; i++)
 	{
 		uint8_t bit = (uint8_t)(1u << i);
-		if (!(obstacle_status.static_mask & bit))
+		if (!(obstacle_map_ready_mask & bit))
 			continue;
 
-		int r = obstacle_status.cell_r[i];
-		int c = obstacle_status.cell_c[i];
+		int r = obstacle_map_candidate_r[i];
+		int c = obstacle_map_candidate_c[i];
 		if (r < 0 || r >= ROWS || c < 0 || c >= COLS ||
 				(r == current_r && c == current_c) ||
 				visits_map[r][c] >= 1.0f)
@@ -1589,6 +1636,11 @@ void gotoXY()
 
 	if (goto_state == GOTO_BACKOFF)
 	{
+		// A blocking hit changes state immediately, so finish the static
+		// confirmation during backoff and commit it once the hold time elapses.
+		if (obstacle_status_is_fresh(now_ms))
+			(void)mark_cached_static_obstacles();
+
 		if ((int32_t)(now_ms - goto_backoff_until_ms) < 0)
 		{
 			Motors_SetPWM(&motors, MOTOR_PWM_MAX_BACKWARD, MOTOR_PWM_MAX_FORWARD);
@@ -1797,6 +1849,11 @@ static void experiment_reset(void)
 	}
 	memset(obstacle_hit_streak, 0, sizeof(obstacle_hit_streak));
 	memset(obstacle_clear_streak, 0, sizeof(obstacle_clear_streak));
+	memset(obstacle_map_candidate_r, -1, sizeof(obstacle_map_candidate_r));
+	memset(obstacle_map_candidate_c, -1, sizeof(obstacle_map_candidate_c));
+	memset(obstacle_map_candidate_since_ms, 0,
+			sizeof(obstacle_map_candidate_since_ms));
+	obstacle_map_ready_mask = 0;
 
 	memset(other_robots, 0, sizeof(other_robots));
 	memset(other_robots_ids, 0, sizeof(other_robots_ids));
@@ -1899,6 +1956,19 @@ void handle_command(void)
 				(void)compute_reachable_cells(sr, sc, topology_reachable, 0u, now_ms);
 				(void)compute_reachable_cells(sr, sc, route_reachable, 1u, now_ms);
 
+				// Only peers in this connected component compete for its remaining
+				// cells. Peers behind a static obstacle must not make this robot yield.
+				int competing_robots = 1;
+				for (int i = 0; i < n_other_robots; i++)
+				{
+					int peer_r, peer_c;
+					if (peer_is_fresh(i, now_ms) &&
+							world_to_cell(other_robots[i][0], other_robots[i][1],
+									&peer_r, &peer_c) &&
+							topology_reachable[peer_r][peer_c])
+						competing_robots++;
+				}
+
 				// find the next best cell to go
 				float fittest = -1; // fitness value to be maximised, initially -1
 				uint8_t have_candidate = 0;
@@ -1978,9 +2048,44 @@ void handle_command(void)
 					}
 				}
 
-				// Each robot makes this topology-aware decision independently. Therefore
-				// an unreachable robot can become inactive while another continues.
-				if (have_candidate)
+				// When fewer reachable cells remain than competing robots, only the
+				// closest robot should pursue each selected final cell. A deterministic
+				// MID tie-break prevents equal-distance robots from both yielding.
+				uint8_t yield_final_cells = 0;
+				if (reachable_unvisited < competing_robots)
+				{
+					if (!have_candidate)
+					{
+						yield_final_cells = 1;
+					}
+					else
+					{
+						cell_center(yt_i, xt_i, &cx, &cy);
+						float own_dist = dist_to_target(x, y, cx, cy);
+						for (int i = 0; i < n_other_robots; i++)
+						{
+							int peer_r, peer_c;
+							if (!peer_is_fresh(i, now_ms) ||
+									!world_to_cell(other_robots[i][0], other_robots[i][1],
+											&peer_r, &peer_c) ||
+									!topology_reachable[peer_r][peer_c])
+								continue;
+
+							float peer_dist = dist_to_target(other_robots[i][0],
+									other_robots[i][1], cx, cy);
+							if (peer_dist + FINAL_CELL_DISTANCE_TIE_M < own_dist ||
+									(fabsf(peer_dist - own_dist) <=
+											FINAL_CELL_DISTANCE_TIE_M &&
+									 other_robots_ids[i] < MID))
+							{
+								yield_final_cells = 1;
+								break;
+							}
+						}
+					}
+				}
+
+				if (have_candidate && !yield_final_cells)
 				{
 					// plan
 					if (!astar_plan_cells(sr, sc, yt_i, xt_i)) {
@@ -1997,10 +2102,10 @@ void handle_command(void)
 					    debug_due = 1;
 					}
 				}
-				else if (reachable_unvisited == 0)
+				else if (reachable_unvisited == 0 || yield_final_cells)
 				{
-					// No currently known route to useful work. Keep Q alive so map
-					// updates can reactivate this robot on a later recheck.
+					// Either this component is complete or a closer peer owns the scarce
+					// final work. Keep Q alive so map/pose updates can reactivate us.
 					Motors_Stop(&motors);
 					path_len = 0;
 					path_idx = 0;
