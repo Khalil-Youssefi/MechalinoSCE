@@ -5,7 +5,7 @@
 
 const char* ssid = "MechalinoAP";
 const char* password = "12345679";
-const int Mechalino_ID = 20;
+const int Mechalino_ID = 15;
 
 ESP8266WebServer server(80);
 
@@ -193,7 +193,8 @@ void handleDebug()
   }
 
   String rep;
-  rep.reserve(1024);
+  // RAW plus the separately labelled 8x11 maps can exceed 3 KiB.
+  rep.reserve(4096);
 
   rep += "RAW=";
   rep += debugRaw;
@@ -243,7 +244,7 @@ void setup() {
   server.on("/debug", HTTP_GET, handleDebug);
   server.begin();
   delay(100);
-  serialBuf.reserve(1200);
+  serialBuf.reserve(2300);
   ensurePoseClientConnected();
 
   udp.begin(UDP_PORT);
@@ -282,7 +283,8 @@ void loop() {
       serialBuf = "";
     } else {
       serialBuf += c;
-      if (serialBuf.length() > 1100) serialBuf = "";
+      // Match the STM32's enlarged debug buffer with room for framing.
+      if (serialBuf.length() > 2200) serialBuf = "";
     }
     
     if ((millis() - last_yield) > 5) {  // every ~5 ms

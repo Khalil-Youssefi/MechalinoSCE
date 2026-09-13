@@ -125,7 +125,7 @@ typedef enum {
 #define X0     0.18f // center of grid cell (0, 0) in arena coordinates
 #define Y0     0.28f // center of grid cell (0, 0) in arena coordinates
 #define COLS   11
-#define ROWS   4
+#define ROWS   8
 
 int path_r[ROWS*COLS];
 int path_c[ROWS*COLS];
@@ -145,11 +145,11 @@ int path_idx = 0;
 #define SCE_FITNESS_TIE_EPS    1.0e-6f
 
 // inter-swarm communication
-#define MID 20                                                    // Mechalino ID (MID)
+#define MID 15                                                    // Mechalino ID (MID)
 #define MAX_OTHER_ROBOTS 10                                      // maximum tracked peers
 #define INVALID_MID 222
 #define OPOS_QUEUE_DEPTH 64                                      // absorbs simultaneous peer broadcast bursts
-#define OPOS_MESSAGE_SIZE 128                                    // M1 packets are below 80 bytes
+#define OPOS_MESSAGE_SIZE 128                                    // 8x11 M1 packets are below 100 bytes
 #define PEER_POSE_TIMEOUT_MS 2000u
 
 // obstacle avoidance params
@@ -385,7 +385,8 @@ void broadcast_pos(uint8_t include_maps);
 /* --- DEBUG --- */
 void debug_send_state(void)
 {
-    static char tx[1024];
+    // The 8x11 maps can produce roughly 1.5 KiB at maximum field widths.
+    static char tx[2048];
     int len = 0;
 
 	uint16_t adc0, adc1, adc2;
