@@ -1,6 +1,7 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <WiFiClient.h>
+#include <stdlib.h>
 
 const char* ssid = "MechalinoAP";
 const char* password = "12345679";
@@ -19,11 +20,9 @@ String serialBuf;
 #include <WiFiUdp.h>
 
 #define UDP_PORT 4242
-#define UDP_TX_PERIOD_MS 200   // 5 Hz
 
 WiFiUDP udp;
 
-static unsigned long udp_last_tx = 0;
 static char udp_rx_buf[256];
 
 String debugRaw = "";
@@ -194,7 +193,8 @@ void handleDebug()
   }
 
   String rep;
-  rep.reserve(1024);
+  // RAW plus the separately labelled 8x11 maps can exceed 3 KiB.
+  rep.reserve(4096);
 
   rep += "RAW=";
   rep += debugRaw;
@@ -244,7 +244,7 @@ void setup() {
   server.on("/debug", HTTP_GET, handleDebug);
   server.begin();
   delay(100);
-  serialBuf.reserve(1200);
+  serialBuf.reserve(2300);
   ensurePoseClientConnected();
 
   udp.begin(UDP_PORT);
@@ -283,7 +283,8 @@ void loop() {
       serialBuf = "";
     } else {
       serialBuf += c;
-      if (serialBuf.length() > 1100) serialBuf = "";
+      // Match the STM32's enlarged debug buffer with room for framing.
+      if (serialBuf.length() > 2200) serialBuf = "";
     }
     
     if ((millis() - last_yield) > 5) {  // every ~5 ms
@@ -293,20 +294,25 @@ void loop() {
   }
 
   /* ---------- UDP RX ---------- */
-  static uint32_t last_opos_fwd = 0;
-  int pkt_len = udp.parsePacket();
-  if (pkt_len > 0) {
+  int pkt_len;
+  while ((pkt_len = udp.parsePacket()) > 0) {
       if (pkt_len >= (int)sizeof(udp_rx_buf))
           pkt_len = sizeof(udp_rx_buf) - 1;
 
       udp.read(udp_rx_buf, pkt_len);
       udp_rx_buf[pkt_len] = '\0';
 
-      if (millis() - last_opos_fwd > 500) { // max 2 Hz forwarding
-        last_opos_fwd = millis();
-        Serial.print("OPOS#");
-        Serial.println(udp_rx_buf);
-      }
+      // Payload starts with "<robot-id>#". Never send our own broadcast
+      // back to the STM32, where it would consume an other-robot slot.
+      char *id_end = nullptr;
+      long sender_id = strtol(udp_rx_buf, &id_end, 10);
+      if (id_end == udp_rx_buf || *id_end != '#' || sender_id == Mechalino_ID)
+          continue;
+
+      // Forward every peer packet. A global time gate loses all but one packet
+      // when several robots make their periodic broadcasts at the same time.
+      Serial.print("OPOS#");
+      Serial.println(udp_rx_buf);
   }
   yield();
 }

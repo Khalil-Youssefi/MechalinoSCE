@@ -43,38 +43,57 @@ typedef enum {
 	GOTO_IDLE = 0,
 	GOTO_ROTATE,
 	GOTO_DRIVE,
-	GOTO_DONE
+	GOTO_BACKOFF,
+	GOTO_DONE,
+	GOTO_INACTIVE
 } goto_state_t;
 
+#define IR_SENSOR_COUNT 3u
+
+typedef struct {
+	uint32_t frame_sequence;
+	uint32_t updated_ms;
+	uint16_t adc_mv[IR_SENSOR_COUNT];
+	uint8_t raw_mask;        // sensors above threshold in the newest frame
+	uint8_t detected_mask;   // debounced sensor detections
+	uint8_t robot_mask;      // detections whose projected point is near a fresh peer
+	uint8_t static_mask;     // detections which should be added to the obstacle map
+	float hit_x[IR_SENSOR_COUNT];
+	float hit_y[IR_SENSOR_COUNT];
+	int8_t cell_r[IR_SENSOR_COUNT];
+	int8_t cell_c[IR_SENSOR_COUNT];
+} obstacle_status_t;
+
 typedef enum {
-    OBS_EVT_NONE = 0,     // no obstacle-related action taken
-    OBS_EVT_STATIC = 1,   // static obstacle mapped
-    OBS_EVT_ROBOT  = 2    // hit was likely another robot -> abandon target
-} obs_evt_t;
+	CAMERA_IDLE = 0,
+	CAMERA_SETTLING,
+	CAMERA_WAITING
+} camera_state_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// Motors PWM values for forward/backward rotation at maximum speed
+// Motors PWM values for forward/backward motion
 #define MOTOR_PWM_STOP 1500
 #define MOTOR_PWM_MAX_BACKWARD 1300
 #define MOTOR_PWM_MAX_FORWARD 1700
-// drive/rotate speeds
-#define ROT_CW_L   (MOTOR_PWM_MAX_FORWARD)
-#define ROT_CW_R   (MOTOR_PWM_MAX_FORWARD)
-#define ROT_CCW_L  (MOTOR_PWM_MAX_BACKWARD)
-#define ROT_CCW_R  (MOTOR_PWM_MAX_BACKWARD)
 #define FWD_L      (MOTOR_PWM_MAX_FORWARD)
 #define FWD_R      (MOTOR_PWM_MAX_BACKWARD)
+
+// Proportional rotation avoids overshooting and oscillating around the target.
+#define ROT_PWM_MIN_DELTA       140.0f
+#define ROT_PWM_MAX_DELTA       200.0f
+#define ROT_PWM_PER_RAD         60.0f
+#define GOTO_ROTATE_TIMEOUT_MS  5000u
 
 // Encoder
 #define ENCODER_RES 20
 
 // Distance sensors
 // Sensors direction relative to robot forward direction
-#define S0_OFF_RAD  (0.0f)
-#define S1_OFF_RAD  (DEG2RAD(-45.0f))                             // s1 is +45 deg
-#define S2_OFF_RAD  (DEG2RAD(+45.0f))                             // s2 is -45 deg
+#define S0_OFF_RAD  (0.0f)                                       // channel 0: front
+#define S1_OFF_RAD  (DEG2RAD(-45.0f))                             // channel 1: front-right
+#define S2_OFF_RAD  (DEG2RAD(+45.0f))                             // channel 7: front-left
 
 #define IRD_NUM_SAMPLES 15
 
@@ -95,16 +114,18 @@ typedef enum {
 #define STOP_SETTLE_MS  150u
 
 // Goto xy thresholds
-#define GOTO_THETA_OK_RAD        (3.0f * (float)M_PI / 180.0f)
-#define GOTO_THETA_DRIVE_MAX_RAD (5.0f * (float)M_PI / 180.0f)
+#define GOTO_THETA_OK_RAD        (5.0f * (float)M_PI / 180.0f)
+#define GOTO_THETA_DRIVE_MAX_RAD (12.0f * (float)M_PI / 180.0f)
 #define GOTO_DIST_OK_M           (0.02f)
+#define INACTIVE_RECHECK_MS       500u
+#define FINAL_CELL_DISTANCE_TIE_M (0.005f)
 
 // grid parameters
 #define CELL   0.15f
-#define X0     0.15f // 0.75f (half cell) + 0.75f (safety not to cover the marker)
-#define Y0     0.15f // 0.75f (half cell) + 0.75f (safety not to cover the marker)
+#define X0     0.18f // center of grid cell (0, 0) in arena coordinates
+#define Y0     0.28f // center of grid cell (0, 0) in arena coordinates
 #define COLS   11
-#define ROWS   4
+#define ROWS   8
 
 int path_r[ROWS*COLS];
 int path_c[ROWS*COLS];
@@ -115,22 +136,36 @@ int path_idx = 0;
 #define INVALID_POS -1000.0f
 #define MAX_VISIT_AND_PENALTY_COUNT 1000.0f
 
-// inter-swarm communication
-#define MID 16                                                    // Mechalino ID (MID)
-#define MAX_OTHER_ROBOTS 4                                        // max number of others (Maximum Swarm Size=5)
-#define INVALID_MID 222
+// SCE fitness parameters. The paper reports stable behavior for kappa > mu > lambda.
+#define SCE_KAPPA              20u
+#define SCE_MU                 4u
+#define SCE_LAMBDA             2u
+#define SCE_HEADING_WEIGHT     2.0f
+#define SCE_PENALTY_DECAY      0.9f
+#define SCE_FITNESS_TIE_EPS    1.0e-6f
 
-// recovery window for broadcasts
-#define REC_WINDOW 5
+// inter-swarm communication
+#define MID 15                                                    // Mechalino ID (MID)
+#define MAX_OTHER_ROBOTS 10                                      // maximum tracked peers
+#define INVALID_MID 222
+#define OPOS_QUEUE_DEPTH 64                                      // absorbs simultaneous peer broadcast bursts
+#define OPOS_MESSAGE_SIZE 128                                    // 8x11 M1 packets are below 100 bytes
+#define PEER_POSE_TIMEOUT_MS 2000u
 
 // obstacle avoidance params
-#define OBSTACLE_DIST_M       0.15f
-#define OBSTACLE_MARK_R       0.075f
-
-#define OBSTACLE_TH_MV        1500u                                // general
-#define OBSTACLE_TH0_MV       1000u                                // front
-#define OBSTACLE_TH1_MV       1000u                               // front-right
-#define OBSTACLE_TH2_MV       1000u                               // front-left
+#define OBSTACLE_DIST_M       0.17f
+#define OBSTACLE_TH0_MV       1600u                               // front trigger; lower than both sides
+#define OBSTACLE_SIDE_TH_MV   1800u                               // symmetric +/-45-degree trigger
+#define OBSTACLE_TH1_MV        OBSTACLE_SIDE_TH_MV                // front-right (DMUX channel 1)
+#define OBSTACLE_TH2_MV        OBSTACLE_SIDE_TH_MV                // front-left (DMUX channel 7)
+#define OBSTACLE_CLEAR_TH0_MV 1400u                               // front release
+#define OBSTACLE_SIDE_CLEAR_MV 1600u                              // symmetric +/-45-degree release
+#define OBSTACLE_CLEAR_TH1_MV OBSTACLE_SIDE_CLEAR_MV              // front-right release
+#define OBSTACLE_CLEAR_TH2_MV OBSTACLE_SIDE_CLEAR_MV              // front-left release
+#define OBSTACLE_CONFIRM_FRAMES 3u
+#define OBSTACLE_MAP_CONFIRM_MS 100u                              // same static sensor/cell must persist before mapping
+#define OBSTACLE_STATUS_STALE_MS 100u
+#define OBSTACLE_BACKOFF_MS   800u
 
 #define DEG2RAD(x) ((x) * (float)M_PI / 180.0f)
 
@@ -167,21 +202,21 @@ volatile int32_t encoder_right_count = 0;
 volatile int32_t encoder_left_count = 0;
 
 // Distance sensors
-#define N_ACIVE_IR_SENSORS 8
+#define N_IR_ADC_CHANNELS 8u
 volatile uint16_t adc_buffer[IRD_NUM_SAMPLES];
-volatile uint16_t adc_readings_off[N_ACIVE_IR_SENSORS];  // active DMUX channels are 0, 1 and 7 when IR LED is off
-volatile uint16_t adc_readings_on[N_ACIVE_IR_SENSORS];  // active DMUX channels are 0, 1 and 7 when IR LED is on
-volatile uint16_t adc_readings[N_ACIVE_IR_SENSORS];  // active DMUX channels are 0, 1 and 7 [difference between on and off]
+volatile uint16_t adc_readings_off[N_IR_ADC_CHANNELS];
+volatile uint16_t adc_readings_on[N_IR_ADC_CHANNELS];
+volatile uint16_t adc_readings[N_IR_ADC_CHANNELS];
 uint8_t current_step = 0; // step 0: IR LED off, step 1: IR LED on
 uint8_t current_dmux_index = 0;
-const uint8_t dmux_channels[8] = {0, 1, 2, 3, 4, 5, 6, 7}; // TODO: active DMUX channels
+const uint8_t dmux_channels[IR_SENSOR_COUNT] = {0u, 1u, 7u};
+volatile uint32_t adc_frame_sequence = 0;
 
 // Serial communication with ESP8266
 uint8_t rxByte;
 char rxBuffer[256];
 uint8_t rxIndex = 0;
 volatile uint8_t posReady = 0;
-volatile uint8_t oposReady = 0;
 volatile uint8_t cmdReady  = 0;
 char cmdBuffer[256];
 char posBuffer[256];
@@ -194,8 +229,17 @@ float robot_theta_error = 0.0f;
 
 uint8_t initial_pos = 1;
 volatile uint8_t broadcastPOS_due = 0; // flag to broadcast position
+volatile uint8_t broadcastMAP_due = 0; // flag to broadcast position plus SCE maps
+volatile uint8_t debug_due = 0; // periodic or obstacle-state-change debug message
 volatile uint8_t odom_due = 0; // flag to request odom update
 volatile uint32_t cam_due  = 0; // flag for request cam pos update
+
+static camera_state_t camera_state = CAMERA_IDLE;
+static uint32_t camera_state_started_ms = 0;
+static uint16_t camera_saved_pwm_l = MOTOR_PWM_STOP;
+static uint16_t camera_saved_pwm_r = MOTOR_PWM_STOP;
+static char camera_saved_command = 'X';
+static goto_state_t camera_saved_goto_state = GOTO_IDLE;
 
 // Remote control
 char command = 'X';
@@ -206,6 +250,9 @@ uint32_t cmd_end;
 // GOTO XY
 
 volatile goto_state_t goto_state = GOTO_IDLE;
+static uint32_t goto_rotate_started_ms = 0;
+static uint32_t goto_backoff_until_ms = 0;
+static uint32_t inactive_recheck_ms = 0;
 
 float xt,yt; // target point (center of the target cell)
 int xt_i, yt_i; // grid indices of the target cell
@@ -214,19 +261,32 @@ int xt_i, yt_i; // grid indices of the target cell
 float visits_map[ROWS][COLS] = {0};
 float penalties_map[ROWS][COLS] = {0};
 float obstacles_map[ROWS][COLS] = {0};
+static int last_visit_r = -1;
+static int last_visit_c = -1;
+static uint32_t sce_rng_state = 0x9E3779B9u ^ ((uint32_t)MID * 0x85EBCA6Bu);
 
-uint8_t obs_hits = 0;
-#define OBS_HITS_N  3   // require 3 consecutive detections
+static obstacle_status_t obstacle_status = {
+	.cell_r = {-1, -1, -1},
+	.cell_c = {-1, -1, -1}
+};
+static uint8_t obstacle_hit_streak[IR_SENSOR_COUNT] = {0};
+static uint8_t obstacle_clear_streak[IR_SENSOR_COUNT] = {0};
+static int8_t obstacle_map_candidate_r[IR_SENSOR_COUNT] = {-1, -1, -1};
+static int8_t obstacle_map_candidate_c[IR_SENSOR_COUNT] = {-1, -1, -1};
+static uint32_t obstacle_map_candidate_since_ms[IR_SENSOR_COUNT] = {0};
+static uint8_t obstacle_map_ready_mask = 0;
 
 // inter swarm communication
-char oposBuffer[256];
 float other_robots[MAX_OTHER_ROBOTS][2];
 uint8_t other_robots_ids[MAX_OTHER_ROBOTS] = {0};
+uint32_t other_robots_last_seen_ms[MAX_OTHER_ROBOTS] = {0};
 uint8_t n_other_robots = 0;
-
-// recovery window for broadcasts
-static int16_t rec_cells[REC_WINDOW][2];  // [i][0]=r, [i][1]=c
-static uint8_t rec_head = 0;
+static uint8_t accept_peer_maps = 0;
+static char opos_queue[OPOS_QUEUE_DEPTH][OPOS_MESSAGE_SIZE];
+static volatile uint8_t opos_q_head = 0;
+static volatile uint8_t opos_q_tail = 0;
+static volatile uint8_t opos_q_count = 0;
+static volatile uint32_t opos_drop_count = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -258,7 +318,8 @@ void update_odometry(void);
 /* --- Camera position (UART request + LPF) --- */
 static int  parse_pos_reply(const char *s, float *x, float *y, float *th);
 static void lpf_update_pos(float x_meas, float y_meas, float th_meas);
-void request_camera_correction(void);
+static void camera_correction_step(uint8_t request_due);
+static int camera_correction_busy(void);
 
 /* --- DMUX + ADC scanning --- */
 void Set_DMUX_Address(uint8_t address);
@@ -269,33 +330,39 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc);
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
 void parse_command_if_ready(void);
 
-/* --- SCE memory / recovery window --- */
-static void   rec_init(void);
-static void   rec_push_cell(int r, int c);
+/* --- SCE memory --- */
 static inline int round_nearest(float v);
+static int world_to_cell(float x, float y, int *r, int *c);
+static uint32_t sce_random(void);
 
 void  penalize_target_cell(void);
 void  discount_penalties(void);
 void  visits_map_update(float x, float y);
 float fpow_simple(float base, unsigned exp);
 
-/* --- Obstacle projection + visited marking --- */
+/* --- Continuous obstacle sensing, classification and map projection --- */
 static inline void unit_vec_from_theta(float th, float off, float *ux, float *uy);
 
 static inline void obstacle_pos_from_pos_and_offset(float x, float y, float th,
 		float dist_m, float off_rad,
 		float *ox, float *oy);
-
-//static void visits_map_mark_radius(float ox, float oy, float r);
-//static void obstacles_map_mark_radius(float ox, float oy, float r);
-//static void mark_obstacle_cells_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2);
-//static obs_evt_t mark_obstacles_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2);
+static void obstacle_status_update(void);
+static int obstacle_status_is_fresh(uint32_t now_ms);
+static int mark_cached_static_obstacles(void);
+static uint8_t obstacle_mask_blocking_motion(void);
+static int remaining_path_has_static_obstacle(void);
 
 static inline void cell_center(int r, int c, float *cx, float *cy);
 
 
 /* --- GOTO XY helpers + state machine --- */
 static inline int cell_is_free(int r, int c);
+static inline int peer_is_fresh(int i, uint32_t now_ms);
+static int active_peer_count(uint32_t now_ms);
+static int cell_is_occupied_by_peer(int r, int c, uint32_t now_ms);
+static int compute_reachable_cells(int sr, int sc,
+		uint8_t reachable[ROWS][COLS], uint8_t block_peers,
+		uint32_t now_ms);
 static inline float h_manhattan(int r, int c, int tr, int tc);
 static int astar_plan_cells(int sr, int sc, int tr, int tc);
 
@@ -307,31 +374,74 @@ static float desired_theta_to_target(float x, float y, float th, float tx, float
 static float heading_error_to_target(float x, float y, float th, float tx, float ty);
 static float dist_to_target(float x, float y, float tx, float ty);
 
-static inline int obstacle_in_front(void);
-
 void gotoXY(void);
+static void experiment_reset(void);
 void handle_command(void);
 
 /* --- Inter-swarm / broadcasts --- */
 void handle_opos_if_ready(void);
-void broadcast_pos(void);
+void broadcast_pos(uint8_t include_maps);
 
-/* --- DEBGUG --- */
+/* --- DEBUG --- */
 void debug_send_state(void)
 {
-    static char tx[1024];
+    // The 8x11 maps can produce roughly 1.5 KiB at maximum field widths.
+    static char tx[2048];
     int len = 0;
 
-    uint16_t adc0, adc1, adc2;
+	uint16_t adc0, adc1, adc2;
+	uint8_t queue_count;
+	uint32_t queue_drops;
 
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
-    adc0 = adc_readings[0];
-    adc1 = adc_readings[1];
-    adc2 = adc_readings[2];
-    __set_PRIMASK(primask);
+	queue_count = opos_q_count;
+	queue_drops = opos_drop_count;
+	__set_PRIMASK(primask);
+	adc0 = obstacle_status.adc_mv[0];
+	adc1 = obstacle_status.adc_mv[1];
+	adc2 = obstacle_status.adc_mv[2];
 
-    len += snprintf(tx + len, sizeof(tx) - len, "DEBUG#V:");
+	uint32_t now_ms = HAL_GetTick();
+	uint32_t obstacle_age_ms = obstacle_status.frame_sequence
+			? (now_ms - obstacle_status.updated_ms) : UINT32_MAX;
+
+	// IR fields: frame, age_ms, fresh, raw, confirmed, robot, static, goto_state.
+	// Mask bits: bit 0 = front, bit 1 = front-right, bit 2 = front-left.
+	// IC contains the projected row/column for front, front-right, front-left.
+	len += snprintf(tx + len, sizeof(tx) - len,
+			"DEBUG#IR:%lu,%lu,%u,%X,%X,%X,%X,%u#IC:%d,%d;%d,%d;%d,%d"
+			"#N:%c,%u,%u,%u,%d,%d,%.3f,%.3f,%.3f,%.3f#R:",
+			(unsigned long)obstacle_status.frame_sequence,
+			(unsigned long)obstacle_age_ms,
+			(unsigned int)obstacle_status_is_fresh(now_ms),
+			(unsigned int)obstacle_status.raw_mask,
+			(unsigned int)obstacle_status.detected_mask,
+			(unsigned int)obstacle_status.robot_mask,
+			(unsigned int)obstacle_status.static_mask,
+			(unsigned int)goto_state,
+			(int)obstacle_status.cell_r[0], (int)obstacle_status.cell_c[0],
+			(int)obstacle_status.cell_r[1], (int)obstacle_status.cell_c[1],
+			(int)obstacle_status.cell_r[2], (int)obstacle_status.cell_c[2],
+			command,
+			(unsigned int)camera_state,
+			(unsigned int)motors.pwm_l,
+			(unsigned int)motors.pwm_r,
+			path_idx, path_len,
+			robot_x, robot_y, robot_theta, robot_theta_error);
+	for (int i = 0; i < n_other_robots; i++)
+	{
+		uint32_t age_ms = now_ms - other_robots_last_seen_ms[i];
+		len += snprintf(tx + len, sizeof(tx) - len,
+				"%s%u,%.3f,%.3f,%lu",
+				(i == 0) ? "" : ";",
+				(unsigned int)other_robots_ids[i],
+				other_robots[i][0], other_robots[i][1],
+				(unsigned long)age_ms);
+	}
+
+	len += snprintf(tx + len, sizeof(tx) - len, "#Q:%u,%lu#V:",
+			(unsigned int)queue_count, (unsigned long)queue_drops);
 
     for (int r = 0; r < ROWS; r++)
     {
@@ -482,10 +592,17 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 			cam_due++;
 		}
 
-		static uint16_t div300 = 0;
-		if (++div300 >= 300) {     // 3 seconds @ 100 Hz
-			div300 = 0;
+		static uint16_t div50 = 0;
+		if (++div50 >= 50) {       // position at 2 Hz
+			div50 = 0;
 			broadcastPOS_due = 1;
+		}
+
+		static uint16_t div100 = 0;
+		if (++div100 >= 100) {     // full SCE maps at 1 Hz
+			div100 = 0;
+			broadcastMAP_due = 1;
+			debug_due = 1;
 		}
 	}
 }
@@ -564,71 +681,89 @@ static void lpf_update_pos(float x_meas, float y_meas, float th_meas)
 	// normalize robot_theta * even for abs update
 	if (robot_theta >  M_PI) robot_theta -= 2.0f * M_PI;
 	if (robot_theta < -M_PI) robot_theta += 2.0f * M_PI;
+
+	// Do not wait for the next 2 Hz slot to share a camera-corrected pose.
+	broadcastPOS_due = 1;
 }
 
-// request camera correction (Serial to ESP)
-// if command is 'P', does nothing (to avoid Serial conflicts)
-// Stop motors, waits a bit and then sends "POS?\n" to ESP
-// waits a maximum of POS_WAIT_MS for a Serial reply from ESP (ESP gets that from ROS_
-// updates pos using a simple LPF
-// restores motors speeds back
-void request_camera_correction(void)
+// Non-blocking camera correction. Keeping this state machine out of a wait loop
+// lets IR classification, peer RX and periodic pose TX continue during the
+// mechanical settling and ROS response windows.
+static void camera_correction_step(uint8_t request_due)
 {
-	// if command P as active, then don't pull cam pos, because of Serial conflicts
-	if (command == 'P')
-		return;
+	uint32_t now_ms = HAL_GetTick();
 
-	// 1) motor_L and motor_R keep current commanded motor PWM "speeds"
-	uint16_t motor_L = motors.pwm_l;
-	uint16_t motor_R = motors.pwm_r;
-
-	// 2) stop robot
-	Motors_Stop(&motors);
-
-	// 3) let mechanics settle
-	HAL_Delay(STOP_SETTLE_MS);
-
-	// 4) request pos from ESP (serial)
-	const char req[] = "POS?\n";
-	(void)HAL_UART_Transmit(&huart1, (uint8_t*)req, (uint16_t)(sizeof(req) - 1), 50);
-
-	// 5) wait for reply (max POS_WAIT_MS); if no reply -> ignore
-	// Clear any previous message atomically
+	if (camera_state == CAMERA_IDLE)
 	{
+		if (!request_due || command == 'P')
+			return;
+
+		camera_saved_pwm_l = motors.pwm_l;
+		camera_saved_pwm_r = motors.pwm_r;
+		camera_saved_command = command;
+		camera_saved_goto_state = goto_state;
+		Motors_Stop(&motors);
+		camera_state_started_ms = now_ms;
+		camera_state = CAMERA_SETTLING;
+		return;
+	}
+
+	if (camera_state == CAMERA_SETTLING)
+	{
+		if ((now_ms - camera_state_started_ms) < STOP_SETTLE_MS)
+			return;
+
+		// Discard any late reply from an older request before starting a new one.
 		uint32_t primask = __get_PRIMASK();
 		__disable_irq();
 		posReady = 0;
 		posBuffer[0] = '\0';
 		__set_PRIMASK(primask);
+
+		const char req[] = "POS?\n";
+		(void)HAL_UART_Transmit(&huart1, (uint8_t*)req,
+				(uint16_t)(sizeof(req) - 1), 50);
+		camera_state_started_ms = HAL_GetTick();
+		camera_state = CAMERA_WAITING;
+		return;
 	}
 
-	uint32_t t0 = HAL_GetTick();
-	while ((HAL_GetTick() - t0) < POS_WAIT_MS)
+	int finished = 0;
+	if (posReady)
 	{
-		if (posReady)
-		{
-			char local[256];
+		char local[256];
+		uint32_t primask = __get_PRIMASK();
+		__disable_irq();
+		posReady = 0;
+		strncpy(local, posBuffer, sizeof(local));
+		local[sizeof(local) - 1] = '\0';
+		__set_PRIMASK(primask);
 
-			// copy buffer atomically and clear flag
-			uint32_t primask = __get_PRIMASK();
-			__disable_irq();
-			posReady = 0;
-			strncpy(local, posBuffer, sizeof(local));
-			local[sizeof(local) - 1] = '\0';
-			__set_PRIMASK(primask);
-
-			float x_meas, y_meas, th_meas;
-			if (parse_pos_reply(local, &x_meas, &y_meas, &th_meas))
-			{
-				// 6) update pos with LPF
-				lpf_update_pos(x_meas, y_meas, th_meas);
-			}
-			break; // either parsed or ignored; in both cases stop waiting
-		}
+		float x_meas, y_meas, th_meas;
+		if (parse_pos_reply(local, &x_meas, &y_meas, &th_meas))
+			lpf_update_pos(x_meas, y_meas, th_meas);
+		finished = 1;
+	}
+	else if ((now_ms - camera_state_started_ms) >= POS_WAIT_MS)
+	{
+		finished = 1;
 	}
 
-	// 7) resume motion (restore previous PWM commands)
-	Motors_SetPWM(&motors, motor_L, motor_R);
+	if (finished)
+	{
+		camera_state = CAMERA_IDLE;
+		// A peer map or a newly parsed command may have cancelled the route while
+		// the camera request was in flight. Never resume stale motor commands.
+		if (command == camera_saved_command && goto_state == camera_saved_goto_state)
+			Motors_SetPWM(&motors, camera_saved_pwm_l, camera_saved_pwm_r);
+		else
+			Motors_Stop(&motors);
+	}
+}
+
+static int camera_correction_busy(void)
+{
+	return (camera_state != CAMERA_IDLE);
 }
 
 // Function to set DMUX address
@@ -657,16 +792,39 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 		HAL_ADC_Stop_DMA(&hadc1);
 
 		// Calculate average
-		uint32_t sum = 0;
-		for(int i = 0; i < IRD_NUM_SAMPLES; i++) {
-			sum += adc_buffer[i];
+//		uint32_t sum = 0;
+//		for(int i = 0; i < IRD_NUM_SAMPLES; i++) {
+//			sum += adc_buffer[i];
+//		}
+//		float miliVolts = (sum * 3300.0f) / (IRD_NUM_SAMPLES * 4095.0f);
+
+		// Median
+		uint16_t samples[IRD_NUM_SAMPLES];
+
+		for (int i = 0; i < IRD_NUM_SAMPLES; i++)
+		    samples[i] = adc_buffer[i];
+
+		for (int i = 1; i < IRD_NUM_SAMPLES; i++) {
+		    uint16_t key = samples[i];
+		    int j = i - 1;
+
+		    while (j >= 0 && samples[j] > key) {
+		        samples[j + 1] = samples[j];
+		        j--;
+		    }
+
+		    samples[j + 1] = key;
 		}
-		float miliVolts = (sum * 3300.0f) / (IRD_NUM_SAMPLES * 4095.0f);
+
+		uint16_t adc_median = samples[IRD_NUM_SAMPLES / 2];
+
+		float miliVolts = adc_median * 3300.0f / 4095.0f;
+		uint8_t channel = dmux_channels[current_dmux_index];
 
 		// Store the reading based on current step
 		if(current_step == 0)  // Step 0: DMUX disabled (OFF reading)
 		{
-			adc_readings_off[current_dmux_index] = (uint16_t)miliVolts;
+			adc_readings_off[channel] = (uint16_t)miliVolts;
 			current_step = 1;
 
 			// Enable DMUX for ON reading
@@ -674,13 +832,13 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 		}
 		else  // Step 1: DMUX enabled (ON reading)
 		{
-			adc_readings_on[current_dmux_index] = (uint16_t)miliVolts;
+			adc_readings_on[channel] = (uint16_t)miliVolts;
 
 			// Calculate difference
-			if (adc_readings_off[current_dmux_index] < adc_readings_on[current_dmux_index])
-				adc_readings[current_dmux_index] = adc_readings_on[current_dmux_index] - adc_readings_off[current_dmux_index];
+			if (adc_readings_off[channel] < adc_readings_on[channel])
+				adc_readings[channel] = adc_readings_on[channel] - adc_readings_off[channel];
 			else
-				adc_readings[current_dmux_index] = 0; // invalid reading
+				adc_readings[channel] = 0; // invalid reading
 
 			current_step = 0;
 
@@ -689,9 +847,10 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 
 			// Move to next channel
 			current_dmux_index++;
-			if(current_dmux_index >= N_ACIVE_IR_SENSORS) { // TODO: make it a param
+			if(current_dmux_index >= IR_SENSOR_COUNT) {
 				current_dmux_index = 0;
-				// All N_ACIVE_IR_SENSORS channels complete!
+				// Publish one coherent frame after all channels are complete.
+				adc_frame_sequence++;
 			}
 
 			// Set new DMUX address for next channel
@@ -708,7 +867,14 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 	if (huart == &huart1)
 	{
-		if (rxByte == '\n')
+		// ESP8266 Serial.println() terminates forwarded OPOS packets with CRLF.
+		// Ignore CR so protocol tokens (especially P1 and the final M1 row mask)
+		// do not retain a trailing '\r' and fail strict parsing.
+		if (rxByte == '\r')
+		{
+			// Ignore it; reception is re-armed below.
+		}
+		else if (rxByte == '\n')
 		{
 			rxBuffer[rxIndex] = '\0';
 
@@ -735,11 +901,39 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 			}
 			else if (strncmp(rxBuffer, "OPOS#", 5) == 0)
 			{
-				if (!oposReady)
+				if (opos_q_count < OPOS_QUEUE_DEPTH)
 				{
-					strncpy(oposBuffer, rxBuffer, sizeof(oposBuffer));
-					oposBuffer[sizeof(oposBuffer) - 1] = '\0';
-					oposReady = 1;
+					uint8_t slot = opos_q_head;
+					strncpy(opos_queue[slot], rxBuffer, sizeof(opos_queue[slot]));
+					opos_queue[slot][sizeof(opos_queue[slot]) - 1] = '\0';
+					opos_q_head = (uint8_t)((slot + 1u) % OPOS_QUEUE_DEPTH);
+					opos_q_count++;
+				}
+				else
+				{
+					int stored = 0;
+
+					// Full M1 snapshots are cumulative and more important than the
+					// high-rate P1 poses. If necessary, evict a queued pose so the
+					// coverage/obstacle history is never dropped behind pose traffic.
+					if (strstr(rxBuffer, "#M1#") != NULL)
+					{
+						uint8_t slot = opos_q_tail;
+						for (uint8_t i = 0; i < opos_q_count; i++)
+						{
+							if (strstr(opos_queue[slot], "#P1") != NULL)
+							{
+								strncpy(opos_queue[slot], rxBuffer, sizeof(opos_queue[slot]));
+								opos_queue[slot][sizeof(opos_queue[slot]) - 1] = '\0';
+								stored = 1;
+								break;
+							}
+							slot = (uint8_t)((slot + 1u) % OPOS_QUEUE_DEPTH);
+						}
+					}
+
+					opos_drop_count++;
+					(void)stored;
 				}
 			}
 			rxIndex = 0;
@@ -824,27 +1018,33 @@ void parse_command_if_ready(void)
 	}
 }
 
-static void rec_init(void)
-{
-	for (int i = 0; i < REC_WINDOW; i++) {
-		rec_cells[i][0] = -1;
-		rec_cells[i][1] = -1;
-	}
-	rec_head = 0;
-}
-
-static void rec_push_cell(int r, int c)
-{
-	rec_cells[rec_head][0] = (int16_t)r;
-	rec_cells[rec_head][1] = (int16_t)c;
-
-	rec_head++;
-	if (rec_head >= REC_WINDOW) rec_head = 0;
-}
-
 static inline int round_nearest(float v)
 {
 	return (v >= 0.0f) ? (int)(v + 0.5f) : (int)(v - 0.5f);
+}
+
+static int world_to_cell(float x, float y, int *r, int *c)
+{
+	int local_c = round_nearest((x - X0) / CELL);
+	int local_r = round_nearest((y - Y0) / CELL);
+
+	if (local_r < 0 || local_r >= ROWS || local_c < 0 || local_c >= COLS)
+		return 0;
+
+	*r = local_r;
+	*c = local_c;
+	return 1;
+}
+
+static uint32_t sce_random(void)
+{
+	// Small deterministic PRNG with a robot-specific seed for SCE random tie breaks.
+	uint32_t x = sce_rng_state;
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	sce_rng_state = x;
+	return x;
 }
 
 void penalize_target_cell(void)
@@ -857,31 +1057,45 @@ void discount_penalties(void)
 {
 	for (uint32_t i = 0; i < ROWS; i++) {
 		for (uint32_t j = 0; j < COLS; j++) {
-			penalties_map[i][j] *= 0.5f;
+			penalties_map[i][j] *= SCE_PENALTY_DECAY;
 		}
 	}
 }
 
 void visits_map_update(float x, float y)
 {
-	int c = round_nearest((x - X0) / CELL);
-	int r = round_nearest((y - Y0) / CELL);
+	int r, c;
+	if (!world_to_cell(x, y, &r, &c))
+		return;
 
-	/* clamp to valid grid */
-	if (c < 0) c = 0;
-	if (c >= COLS) c = COLS - 1;
+	// A robot physically occupying a cell is stronger evidence than an IR-based
+	// obstacle estimate. Keep visited and obstacle mutually exclusive.
+	int obstacle_cleared = (obstacles_map[r][c] >= 1.0f);
+	if (obstacle_cleared)
+		obstacles_map[r][c] = 0.0f;
 
-	if (r < 0) r = 0;
-	if (r >= ROWS) r = ROWS - 1;
-
-	if (visits_map[r][c] == 0)
+	// A visit is a cell-entry event, not one increment per main-loop iteration.
+	if (r == last_visit_r && c == last_visit_c)
 	{
-		discount_penalties();
-		// update recovey window
-		rec_push_cell(r, c);
+		if (obstacle_cleared)
+		{
+			broadcastPOS_due = 1;
+			broadcastMAP_due = 1;
+			debug_due = 1;
+		}
+		return;
 	}
-	if (visits_map[r][c] < MAX_VISIT_AND_PENALTY_COUNT)
-		visits_map[r][c] += 1.0f;
+
+	last_visit_r = r;
+	last_visit_c = c;
+	discount_penalties();
+	// On the physical grid, a confirmed covered cell must remain strongly
+	// unattractive; a value of 1 was too weak against the distance term.
+	visits_map[r][c] = MAX_VISIT_AND_PENALTY_COUNT;
+
+	// Algorithm 1 communicates after every successful cell move.
+	broadcastPOS_due = 1;
+	broadcastMAP_due = 1;
 }
 
 float fpow_simple(float base, unsigned exp)
@@ -909,123 +1123,6 @@ static inline void obstacle_pos_from_pos_and_offset(float x, float y, float th,
 	*oy = y + dist_m * uy;
 }
 
-//static void visits_map_mark_radius(float ox, float oy, float r)
-//{
-//	float r2 = r * r;
-//
-//	for (int rr = 0; rr < ROWS; rr++)
-//	{
-//		for (int cc = 0; cc < COLS; cc++)
-//		{
-//			float cx = cc * CELL + X0;
-//			float cy = rr * CELL + Y0;
-//
-//			float dx = cx - ox;
-//			float dy = cy - oy;
-//
-//			if ((dx*dx + dy*dy) <= r2)
-//			{
-//				if (visits_map[rr][cc] < 1.0f)
-//					visits_map[rr][cc] = 1.0f;
-//			}
-//		}
-//	}
-//}
-
-//static void obstacles_map_mark_radius(float ox, float oy, float r)
-//{
-//    float r2 = r * r;
-//
-//    for (int rr = 0; rr < ROWS; rr++)
-//    {
-//        for (int cc = 0; cc < COLS; cc++)
-//        {
-//            float cx = cc * CELL + X0;
-//            float cy = rr * CELL + Y0;
-//
-//            float dx = cx - ox;
-//            float dy = cy - oy;
-//
-//            if ((dx*dx + dy*dy) <= r2)
-//            {
-//                obstacles_map[rr][cc] = 1.0f;   // occupied
-//            }
-//        }
-//    }
-//}
-
-//static void mark_obstacle_cells_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2)
-//{
-//	// snapshot pos atomically
-//	float x, y, th;
-//	{
-//		uint32_t primask = __get_PRIMASK();
-//		__disable_irq();
-//		x  = robot_x;
-//		y  = robot_y;
-//		th = robot_theta;
-//		__set_PRIMASK(primask);
-//	}
-//
-//	// For each sensor above its threshold, project and mark
-//	float ox, oy;
-//
-//	if (s0 > OBSTACLE_TH0_MV)
-//	{
-//		obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S0_OFF_RAD, &ox, &oy);
-//		visits_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
-//	}
-//
-//	if (s1 > OBSTACLE_TH1_MV)
-//	{
-//		obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S1_OFF_RAD, &ox, &oy);
-//		visits_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
-//	}
-//
-//	if (s2 > OBSTACLE_TH2_MV)
-//	{
-//		obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S2_OFF_RAD, &ox, &oy);
-//		visits_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
-//	}
-//}
-
-//static obs_evt_t mark_obstacles_from_three_sensors(uint16_t s0, uint16_t s1, uint16_t s2)
-//{
-//    float x, y, th;
-//    {
-//        uint32_t primask = __get_PRIMASK();
-//        __disable_irq();
-//        x  = robot_x;
-//        y  = robot_y;
-//        th = robot_theta;
-//        __set_PRIMASK(primask);
-//    }
-//
-//    float ox, oy;
-//    obs_evt_t evt = OBS_EVT_NONE;
-//
-//    if (s0 > OBSTACLE_TH0_MV) {
-//        obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S0_OFF_RAD, &ox, &oy);
-//        if (near_known_robot(ox, oy, ROBOT_AS_OBS_GATE_M)) return OBS_EVT_ROBOT;
-//        obstacles_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
-//        evt = OBS_EVT_STATIC;
-//    }
-//    if (s1 > OBSTACLE_TH1_MV) {
-//        obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S1_OFF_RAD, &ox, &oy);
-//        if (near_known_robot(ox, oy, ROBOT_AS_OBS_GATE_M)) return OBS_EVT_ROBOT;
-//        obstacles_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
-//        evt = OBS_EVT_STATIC;
-//    }
-//    if (s2 > OBSTACLE_TH2_MV) {
-//        obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, S2_OFF_RAD, &ox, &oy);
-//        if (near_known_robot(ox, oy, ROBOT_AS_OBS_GATE_M)) return OBS_EVT_ROBOT;
-//        obstacles_map_mark_radius(ox, oy, OBSTACLE_MARK_R);
-//        evt = OBS_EVT_STATIC;
-//    }
-//
-//    return evt;
-//}
-
 static inline void cell_center(int r, int c, float *cx, float *cy)
 {
     *cx = c * CELL + X0;
@@ -1038,6 +1135,33 @@ static inline int cell_is_free(int r, int c)
     return (obstacles_map[r][c] < 1.0f);
 }
 
+static inline int peer_is_fresh(int i, uint32_t now_ms)
+{
+	return (i >= 0 && i < n_other_robots &&
+			(now_ms - other_robots_last_seen_ms[i]) <= PEER_POSE_TIMEOUT_MS);
+}
+
+static int active_peer_count(uint32_t now_ms)
+{
+	int count = 0;
+	for (int i = 0; i < n_other_robots; i++)
+		if (peer_is_fresh(i, now_ms)) count++;
+	return count;
+}
+
+static int cell_is_occupied_by_peer(int r, int c, uint32_t now_ms)
+{
+	for (int i = 0; i < n_other_robots; i++)
+	{
+		int peer_r, peer_c;
+		if (peer_is_fresh(i, now_ms) &&
+				world_to_cell(other_robots[i][0], other_robots[i][1], &peer_r, &peer_c) &&
+				peer_r == r && peer_c == c)
+			return 1;
+	}
+	return 0;
+}
+
 static inline float h_manhattan(int r, int c, int tr, int tc)
 {
     int dr = (r > tr) ? (r - tr) : (tr - r);
@@ -1045,8 +1169,58 @@ static inline float h_manhattan(int r, int c, int tr, int tc)
     return (float)(dr + dc);
 }
 
+static int compute_reachable_cells(int sr, int sc,
+		uint8_t reachable[ROWS][COLS], uint8_t block_peers,
+		uint32_t now_ms)
+{
+	int queue_r[ROWS * COLS];
+	int queue_c[ROWS * COLS];
+	int head = 0;
+	int tail = 0;
+	static const int dr4[4] = { -1, +1, 0, 0 };
+	static const int dc4[4] = { 0, 0, -1, +1 };
+
+	memset(reachable, 0, ROWS * COLS * sizeof(reachable[0][0]));
+	if (sr < 0 || sr >= ROWS || sc < 0 || sc >= COLS)
+		return 0;
+
+	// The robot's current cell is always a valid flood-fill origin. A noisy IR
+	// projection can occasionally mark that cell while the robot is still in it.
+	reachable[sr][sc] = 1;
+	queue_r[tail] = sr;
+	queue_c[tail] = sc;
+	tail++;
+
+	while (head < tail)
+	{
+		int cr = queue_r[head];
+		int cc = queue_c[head];
+		head++;
+
+		for (int k = 0; k < 4; k++)
+		{
+			int nr = cr + dr4[k];
+			int nc = cc + dc4[k];
+			if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS)
+				continue;
+			if (reachable[nr][nc] || !cell_is_free(nr, nc) ||
+					(block_peers && cell_is_occupied_by_peer(nr, nc, now_ms)))
+				continue;
+
+			reachable[nr][nc] = 1;
+			queue_r[tail] = nr;
+			queue_c[tail] = nc;
+			tail++;
+		}
+	}
+
+	return tail;
+}
+
 static int astar_plan_cells(int sr, int sc, int tr, int tc)
 {
+	uint32_t now_ms = HAL_GetTick();
+
     // arrays
     static uint8_t open[ROWS][COLS];
     static uint8_t closed[ROWS][COLS];
@@ -1067,8 +1241,9 @@ static int astar_plan_cells(int sr, int sc, int tr, int tc)
         }
     }
 
-    if (!cell_is_free(sr, sc)) return 0;
+	if (sr < 0 || sr >= ROWS || sc < 0 || sc >= COLS) return 0;
     if (!cell_is_free(tr, tc)) return 0;
+    if (cell_is_occupied_by_peer(tr, tc, now_ms)) return 0;
 
     open[sr][sc] = 1;
     g[sr][sc] = 0.0f;
@@ -1104,6 +1279,7 @@ static int astar_plan_cells(int sr, int sc, int tr, int tc)
             int nc = cc + dc4[k];
 
             if (!cell_is_free(nr, nc)) continue;
+            if (cell_is_occupied_by_peer(nr, nc, now_ms)) continue;
             if (closed[nr][nc]) continue;
 
             float tentative_g = g[cr][cc] + 1.0f; // uniform cost
@@ -1152,13 +1328,269 @@ static int astar_plan_cells(int sr, int sc, int tr, int tc)
 
 static inline int near_known_robot(float ox, float oy, float gate_m)
 {
+	uint32_t now_ms = HAL_GetTick();
     float gate2 = gate_m * gate_m;
     for (int i = 0; i < n_other_robots; i++) {
+		if (!peer_is_fresh(i, now_ms)) continue;
         float dx = other_robots[i][0] - ox;
         float dy = other_robots[i][1] - oy;
         if ((dx*dx + dy*dy) <= gate2) return 1;
     }
     return 0;
+}
+
+// Consume each completed ADC scan once and keep a continuously available,
+// debounced interpretation of the three forward-facing IR sensors.
+static void obstacle_status_update(void)
+{
+	static uint32_t last_processed_sequence = 0;
+	static const uint16_t threshold_mv[IR_SENSOR_COUNT] = {
+		OBSTACLE_TH0_MV, OBSTACLE_TH1_MV, OBSTACLE_TH2_MV
+	};
+	static const uint16_t clear_threshold_mv[IR_SENSOR_COUNT] = {
+		OBSTACLE_CLEAR_TH0_MV, OBSTACLE_CLEAR_TH1_MV, OBSTACLE_CLEAR_TH2_MV
+	};
+	static const float sensor_offset_rad[IR_SENSOR_COUNT] = {
+		S0_OFF_RAD, S1_OFF_RAD, S2_OFF_RAD
+	};
+
+	uint32_t sequence;
+	uint16_t adc_mv[IR_SENSOR_COUNT];
+	uint32_t primask = __get_PRIMASK();
+	__disable_irq();
+	sequence = adc_frame_sequence;
+	for (uint32_t i = 0; i < IR_SENSOR_COUNT; i++)
+		adc_mv[i] = adc_readings[dmux_channels[i]];
+	__set_PRIMASK(primask);
+
+	if (sequence == 0 || sequence == last_processed_sequence)
+		return;
+	last_processed_sequence = sequence;
+
+	float x, y, th;
+	primask = __get_PRIMASK();
+	__disable_irq();
+	x = robot_x;
+	y = robot_y;
+	th = robot_theta;
+	__set_PRIMASK(primask);
+
+	uint8_t previous_detected = obstacle_status.detected_mask;
+	uint8_t previous_robot = obstacle_status.robot_mask;
+	uint8_t previous_static = obstacle_status.static_mask;
+	uint8_t previous_map_ready = obstacle_map_ready_mask;
+	uint8_t raw_mask = 0;
+	uint8_t detected_mask = obstacle_status.detected_mask;
+
+	for (uint32_t i = 0; i < IR_SENSOR_COUNT; i++)
+	{
+		uint8_t bit = (uint8_t)(1u << i);
+		obstacle_status.adc_mv[i] = adc_mv[i];
+
+		if (adc_mv[i] > threshold_mv[i])
+			raw_mask |= bit;
+
+		if (detected_mask & bit)
+		{
+			// Once asserted, retain the detection through the hysteresis band and
+			// clear it only after several readings below the lower threshold.
+			obstacle_hit_streak[i] = 0;
+			if (adc_mv[i] < clear_threshold_mv[i])
+			{
+				if (obstacle_clear_streak[i] < OBSTACLE_CONFIRM_FRAMES)
+					obstacle_clear_streak[i]++;
+			}
+			else
+			{
+				obstacle_clear_streak[i] = 0;
+			}
+
+			if (obstacle_clear_streak[i] >= OBSTACLE_CONFIRM_FRAMES)
+				detected_mask &= (uint8_t)~bit;
+		}
+		else
+		{
+			obstacle_clear_streak[i] = 0;
+			if (adc_mv[i] > threshold_mv[i])
+			{
+				if (obstacle_hit_streak[i] < OBSTACLE_CONFIRM_FRAMES)
+					obstacle_hit_streak[i]++;
+			}
+			else
+			{
+				obstacle_hit_streak[i] = 0;
+			}
+
+			if (obstacle_hit_streak[i] >= OBSTACLE_CONFIRM_FRAMES)
+				detected_mask |= bit;
+		}
+	}
+
+	obstacle_status.raw_mask = raw_mask;
+	obstacle_status.detected_mask = detected_mask;
+	obstacle_status.robot_mask = 0;
+	obstacle_status.static_mask = 0;
+
+	for (uint32_t i = 0; i < IR_SENSOR_COUNT; i++)
+	{
+		uint8_t bit = (uint8_t)(1u << i);
+		obstacle_status.cell_r[i] = -1;
+		obstacle_status.cell_c[i] = -1;
+		obstacle_status.hit_x[i] = INVALID_POS;
+		obstacle_status.hit_y[i] = INVALID_POS;
+
+		if (!(detected_mask & bit))
+			continue;
+
+		float ox, oy;
+		obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M,
+				sensor_offset_rad[i], &ox, &oy);
+		obstacle_status.hit_x[i] = ox;
+		obstacle_status.hit_y[i] = oy;
+
+		int r, c;
+		if (world_to_cell(ox, oy, &r, &c))
+		{
+			obstacle_status.cell_r[i] = (int8_t)r;
+			obstacle_status.cell_c[i] = (int8_t)c;
+		}
+
+		if (near_known_robot(ox, oy, ROBOT_AS_OBS_GATE_M))
+			obstacle_status.robot_mask |= bit;
+		else
+			obstacle_status.static_mask |= bit;
+	}
+
+	uint32_t now_ms = HAL_GetTick();
+	obstacle_status.frame_sequence = sequence;
+	obstacle_status.updated_ms = now_ms;
+
+	// Collision avoidance keeps the fast sensor debounce above, but persistent
+	// mapping is deliberately slower. A candidate must remain classified as
+	// static in the same projected grid cell while driving for the full hold time.
+	// Any sensor clear, peer classification, cell change, or non-driving state
+	// cancels that candidate before it can contaminate the shared map.
+	for (uint32_t i = 0; i < IR_SENSOR_COUNT; i++)
+	{
+		uint8_t bit = (uint8_t)(1u << i);
+		int r = obstacle_status.cell_r[i];
+		int c = obstacle_status.cell_c[i];
+		int valid_static_cell =
+				(goto_state == GOTO_DRIVE || goto_state == GOTO_BACKOFF) &&
+				(obstacle_status.static_mask & bit) != 0 &&
+				r >= 0 && r < ROWS && c >= 0 && c < COLS;
+
+		if (!valid_static_cell)
+		{
+			obstacle_map_candidate_r[i] = -1;
+			obstacle_map_candidate_c[i] = -1;
+			obstacle_map_candidate_since_ms[i] = 0;
+			obstacle_map_ready_mask &= (uint8_t)~bit;
+			continue;
+		}
+
+		if (obstacle_map_candidate_r[i] != r ||
+				obstacle_map_candidate_c[i] != c)
+		{
+			obstacle_map_candidate_r[i] = (int8_t)r;
+			obstacle_map_candidate_c[i] = (int8_t)c;
+			obstacle_map_candidate_since_ms[i] = now_ms;
+			obstacle_map_ready_mask &= (uint8_t)~bit;
+		}
+		else if ((now_ms - obstacle_map_candidate_since_ms[i]) >=
+				OBSTACLE_MAP_CONFIRM_MS)
+		{
+			obstacle_map_ready_mask |= bit;
+		}
+	}
+
+	if (previous_detected != obstacle_status.detected_mask ||
+			previous_robot != obstacle_status.robot_mask ||
+			previous_static != obstacle_status.static_mask ||
+			previous_map_ready != obstacle_map_ready_mask)
+		debug_due = 1;
+}
+
+static int obstacle_status_is_fresh(uint32_t now_ms)
+{
+	return (obstacle_status.frame_sequence != 0 &&
+			(now_ms - obstacle_status.updated_ms) <= OBSTACLE_STATUS_STALE_MS);
+}
+
+// Mapping is deliberately separate from continuous classification: sensing can
+// run while idle or rotating, while only a static sensor/cell candidate held for
+// OBSTACLE_MAP_CONFIRM_MS during driving/backoff reaches the persistent map.
+static int mark_cached_static_obstacles(void)
+{
+	int current_r = -1;
+	int current_c = -1;
+	(void)world_to_cell(robot_x, robot_y, &current_r, &current_c);
+
+	int changed = 0;
+	for (uint32_t i = 0; i < IR_SENSOR_COUNT; i++)
+	{
+		uint8_t bit = (uint8_t)(1u << i);
+		if (!(obstacle_map_ready_mask & bit))
+			continue;
+
+		int r = obstacle_map_candidate_r[i];
+		int c = obstacle_map_candidate_c[i];
+		if (r < 0 || r >= ROWS || c < 0 || c >= COLS ||
+				(r == current_r && c == current_c) ||
+				visits_map[r][c] >= 1.0f)
+			continue;
+
+		if (obstacles_map[r][c] < 1.0f)
+		{
+			obstacles_map[r][c] = 1.0f;
+			changed = 1;
+		}
+	}
+
+	if (changed)
+	{
+		broadcastPOS_due = 1;
+		broadcastMAP_due = 1;
+		debug_due = 1;
+	}
+	return changed;
+}
+
+// A front hit is an immediate translation hazard. Angled sensors block motion
+// only when their projected cell is the next waypoint; otherwise they can see
+// an obstacle beside the robot without preventing a safe turn or forward path.
+static uint8_t obstacle_mask_blocking_motion(void)
+{
+	uint8_t detected = obstacle_status.detected_mask;
+	uint8_t blocking = detected & 0x01u;
+
+	if (path_idx < 0 || path_idx >= path_len)
+		return blocking;
+
+	int next_r = path_r[path_idx];
+	int next_c = path_c[path_idx];
+	for (uint32_t i = 1; i < IR_SENSOR_COUNT; i++)
+	{
+		uint8_t bit = (uint8_t)(1u << i);
+		if ((detected & bit) &&
+				obstacle_status.cell_r[i] == next_r &&
+				obstacle_status.cell_c[i] == next_c)
+			blocking |= bit;
+	}
+	return blocking;
+}
+
+static int remaining_path_has_static_obstacle(void)
+{
+	for (int i = path_idx; i < path_len; i++)
+	{
+		int r = path_r[i];
+		int c = path_c[i];
+		if (r >= 0 && r < ROWS && c >= 0 && c < COLS &&
+				obstacles_map[r][c] >= 1.0f)
+			return 1;
+	}
+	return 0;
 }
 
 static float wrap_pi(float a)
@@ -1191,30 +1623,38 @@ static float dist_to_target(float x, float y, float tx, float ty)
 	return sqrtf(dx*dx + dy*dy);
 }
 
-static inline int obstacle_in_front(void)
-{
-	uint16_t s0, s1, s2;
-
-	// atomic snapshot
-	uint32_t primask = __get_PRIMASK();
-	__disable_irq();
-	s0 = adc_readings[0];   // front
-	s1 = adc_readings[1];   // front-right
-	s2 = adc_readings[2];   // front-left
-	__set_PRIMASK(primask);
-
-	// no obstacle
-	if (s0 <= OBSTACLE_TH0_MV && s1 <= OBSTACLE_TH1_MV && s2 <= OBSTACLE_TH2_MV) {
-		return 0;
-	}
-
-	// any obstacle detected
-	return 1;
-}
-
 // non-blocking step function
 void gotoXY()
 {
+	uint32_t now_ms = HAL_GetTick();
+
+	// DONE/INACTIVE mean there is no active route. Never consume stale waypoints
+	// in these states; doing so allowed
+	// path_idx to increment once per main-loop pass and eventually overflow.
+	if (goto_state == GOTO_IDLE || goto_state == GOTO_DONE ||
+			goto_state == GOTO_INACTIVE)
+		return;
+
+	if (goto_state == GOTO_BACKOFF)
+	{
+		// A blocking hit changes state immediately, so finish the static
+		// confirmation during backoff and commit it once the hold time elapses.
+		if (obstacle_status_is_fresh(now_ms))
+			(void)mark_cached_static_obstacles();
+
+		if ((int32_t)(now_ms - goto_backoff_until_ms) < 0)
+		{
+			Motors_SetPWM(&motors, MOTOR_PWM_MAX_BACKWARD, MOTOR_PWM_MAX_FORWARD);
+		}
+		else
+		{
+			Motors_Stop(&motors);
+			goto_state = GOTO_DONE;
+			debug_due = 1;
+		}
+		return;
+	}
+
 	// snapshot pos atomically
 	float x, y, th;
 	{
@@ -1229,6 +1669,7 @@ void gotoXY()
 	float d = dist_to_target(x, y, xt, yt);
 	float e = heading_error_to_target(x, y, th, xt, yt);  // + => need CW, - => need CCW
 	robot_theta_error = e;
+
 	// stop condition
 	if (d <= GOTO_DIST_OK_M)
 	{
@@ -1239,6 +1680,7 @@ void gotoXY()
 		    goto_state = GOTO_DONE;
 		} else {
 		    cell_center(path_r[path_idx], path_c[path_idx], &xt, &yt);
+		    goto_rotate_started_ms = now_ms;
 		    goto_state = GOTO_ROTATE;
 		}
 		return;
@@ -1248,100 +1690,101 @@ void gotoXY()
 	{
 	case GOTO_ROTATE:
 	{
-		// if aligned enough -> start driving
+		// Alignment takes priority over the timeout. The camera may report the
+		// final corrected heading at the timeout boundary; rejecting an already
+		// aligned robot here caused repeated DONE/replan cycles without driving.
 		if (fabsf(e) <= GOTO_THETA_OK_RAD)
 		{
-			Motors_SetPWM(&motors, MOTOR_PWM_MAX_FORWARD, MOTOR_PWM_MAX_BACKWARD);
+			Motors_Stop(&motors);
 			goto_state = GOTO_DRIVE;
+			debug_due = 1;
+		}
+		else if ((now_ms - goto_rotate_started_ms) > GOTO_ROTATE_TIMEOUT_MS)
+		{
+			Motors_Stop(&motors);
+			penalize_target_cell();
+			goto_state = GOTO_DONE;
+			debug_due = 1;
+			return;
 		}
 		else
 		{
+			float effort = ROT_PWM_MIN_DELTA + ROT_PWM_PER_RAD * fabsf(e);
+			if (effort > ROT_PWM_MAX_DELTA) effort = ROT_PWM_MAX_DELTA;
+			uint16_t delta = (uint16_t)effort;
+
 			// rotate towards target
 			if (e > 0.0f)
 			{
 				// CW
-				Motors_SetPWM(&motors, ROT_CW_L, ROT_CW_R);
+				Motors_SetPWM(&motors, MOTOR_PWM_STOP + delta, MOTOR_PWM_STOP + delta);
 			}
 			else
 			{
 				// CCW
-				Motors_SetPWM(&motors, ROT_CCW_L, ROT_CCW_R);
+				Motors_SetPWM(&motors, MOTOR_PWM_STOP - delta, MOTOR_PWM_STOP - delta);
 			}
 		}
 	} break;
 
 	case GOTO_DRIVE:
 	{
-		uint16_t s0, s1, s2;
-		// atomic snapshot of sensors
+		// Do not drive on an uninitialised or stale sensor frame. The ADC scan and
+		// classification run independently and this state consumes only the cache.
+		if (!obstacle_status_is_fresh(now_ms))
 		{
-			uint32_t primask = __get_PRIMASK();
-			__disable_irq();
-			s0 = adc_readings[0];   // front
-			s1 = adc_readings[1];   // +45°
-			s2 = adc_readings[2];   // -45°
-			__set_PRIMASK(primask);
-		}
-		// get max of sensor values
-		uint16_t s_max = s0;
-		float offset = 0.0f;
-		if (s1 > s_max) {
-			s_max = s1;
-			offset = S1_OFF_RAD;
-		}
-		else if (s2 > s_max) {
-			s_max = s2;
-			offset = S2_OFF_RAD;
-		}
-
-		// For the sensor with largest value, project and mark
-		if (s_max > OBSTACLE_TH_MV)
-		{
-			// mark obstacle footprint
-			// snapshot pos atomically
-			float x, y, th;
-			{
-				uint32_t primask = __get_PRIMASK();
-				__disable_irq();
-				x  = robot_x;
-				y  = robot_y;
-				th = robot_theta;
-				__set_PRIMASK(primask);
-			}
-
-			float ox, oy;
-			obstacle_pos_from_pos_and_offset(x, y, th, OBSTACLE_DIST_M, offset, &ox, &oy);
-			// obstacle cell
-			int oc_c = round_nearest((ox - X0) / CELL);
-			int oc_r = round_nearest((oy - Y0) / CELL);
-			// current cell can't be marked as obstacle, because the robot is there
-			int cc_c = round_nearest((x - X0) / CELL);
-			int cc_r = round_nearest((y - Y0) / CELL);
-			if (oc_c >= 0 && oc_c < COLS && oc_r >= 0 && oc_r < ROWS && !(oc_r == cc_r && oc_c == cc_c)) {
-				obstacles_map[oc_r][oc_c] = 1.0f; // mark cell as occupied
-				if (visits_map[oc_r][oc_c] == 0)
-				{
-					discount_penalties();
-					// update recovey window
-					rec_push_cell(oc_r, oc_c);
-				}
-				visits_map[oc_r][oc_c] = 1000.0f; // mark cell as visited to avoid it in the future
-			}
-			else
-			{
-				penalize_target_cell(); // if the projected obstacle is out of bounds or on the current cell, just penalize the target cell to avoid it in the future
-			}
-			Motors_SetPWM(&motors, MOTOR_PWM_MAX_BACKWARD, MOTOR_PWM_MAX_FORWARD);
-			HAL_Delay(600); // TODO: param
 			Motors_Stop(&motors);
-			goto_state = GOTO_DONE; // stop and wait for next command to replan, because the current path is now invalid
-			return; // important: don’t continue the old drive logic after replanning
+			return;
+		}
+
+		if (obstacle_status.detected_mask != 0)
+		{
+			// Robot-classified rays are temporary blockages. Only static-classified
+			// rays are committed to the persistent map. A side hit which is not on
+			// the route is useful map information, but is not a collision condition.
+			(void)mark_cached_static_obstacles();
+
+			if (obstacle_mask_blocking_motion() != 0)
+			{
+				penalize_target_cell();
+				Motors_SetPWM(&motors, MOTOR_PWM_MAX_BACKWARD, MOTOR_PWM_MAX_FORWARD);
+				goto_backoff_until_ms = now_ms + OBSTACLE_BACKOFF_MS;
+				goto_state = GOTO_BACKOFF;
+				debug_due = 1;
+				return;
+			}
+
+			// A newly mapped side obstacle may intersect a later waypoint. Replan
+			// without backing away, because it is not an immediate collision.
+			if (remaining_path_has_static_obstacle())
+			{
+				Motors_Stop(&motors);
+				penalize_target_cell();
+				path_len = 0;
+				path_idx = 0;
+				goto_state = GOTO_DONE;
+				debug_due = 1;
+				return;
+			}
+		}
+
+		// If shared pose data shows that the next route cell is occupied, stop
+		// before driving into it. Sensor-triggered backoff above takes priority
+		// whenever the robots are already physically close.
+		if (path_idx < path_len &&
+				cell_is_occupied_by_peer(path_r[path_idx], path_c[path_idx], now_ms))
+		{
+			Motors_Stop(&motors);
+			penalize_target_cell();
+			goto_state = GOTO_DONE;
+			return;
 		}
 
 		// while driving, if heading error grows too big -> stop and rotate again
 		if (fabsf(e) > GOTO_THETA_DRIVE_MAX_RAD)
 		{
 			Motors_Stop(&motors);
+			goto_rotate_started_ms = now_ms;
 			goto_state = GOTO_ROTATE;
 		}
 		else
@@ -1352,6 +1795,7 @@ void gotoXY()
 	} break;
 
 	case GOTO_DONE:
+	case GOTO_INACTIVE:
 	default:
 		// do nothing
 		break;
@@ -1366,16 +1810,106 @@ void gotoXY()
 //     do 1 step of the command
 //     if termination condition is met:
 //         set command var to 'X'
-// supporter commands: S, Q
+// supported commands: H (reset experiment state), S (stop), Q (start coverage)
+static void experiment_reset(void)
+{
+	Motors_Stop(&motors);
+
+	memset(path_r, 0, sizeof(path_r));
+	memset(path_c, 0, sizeof(path_c));
+	path_len = 0;
+	path_idx = 0;
+	memset(params, 0, sizeof(params));
+	cmd_end = 0;
+	xt = 0.0f;
+	yt = 0.0f;
+	xt_i = 0;
+	yt_i = 0;
+	robot_theta_error = 0.0f;
+	goto_rotate_started_ms = 0;
+	goto_backoff_until_ms = 0;
+	inactive_recheck_ms = 0;
+	goto_state = GOTO_IDLE;
+
+	memset(visits_map, 0, sizeof(visits_map));
+	memset(penalties_map, 0, sizeof(penalties_map));
+	memset(obstacles_map, 0, sizeof(obstacles_map));
+	last_visit_r = -1;
+	last_visit_c = -1;
+	sce_rng_state = 0x9E3779B9u ^ ((uint32_t)MID * 0x85EBCA6Bu);
+
+	// Clear the interpreted obstacle state, but deliberately keep the ADC scan
+	// running and leave sensor thresholds/calibration untouched.
+	memset(&obstacle_status, 0, sizeof(obstacle_status));
+	for (uint32_t i = 0; i < IR_SENSOR_COUNT; i++)
+	{
+		obstacle_status.cell_r[i] = -1;
+		obstacle_status.cell_c[i] = -1;
+		obstacle_status.hit_x[i] = INVALID_POS;
+		obstacle_status.hit_y[i] = INVALID_POS;
+	}
+	memset(obstacle_hit_streak, 0, sizeof(obstacle_hit_streak));
+	memset(obstacle_clear_streak, 0, sizeof(obstacle_clear_streak));
+	memset(obstacle_map_candidate_r, -1, sizeof(obstacle_map_candidate_r));
+	memset(obstacle_map_candidate_c, -1, sizeof(obstacle_map_candidate_c));
+	memset(obstacle_map_candidate_since_ms, 0,
+			sizeof(obstacle_map_candidate_since_ms));
+	obstacle_map_ready_mask = 0;
+
+	memset(other_robots, 0, sizeof(other_robots));
+	memset(other_robots_ids, 0, sizeof(other_robots_ids));
+	memset(other_robots_last_seen_ms, 0, sizeof(other_robots_last_seen_ms));
+	n_other_robots = 0;
+	accept_peer_maps = 0;
+
+	// Drop packets from the preceding run atomically. Fresh peer poses may still
+	// be collected while idle, but M1 maps are ignored until Q starts the run.
+	uint32_t primask = __get_PRIMASK();
+	__disable_irq();
+	opos_q_head = 0;
+	opos_q_tail = 0;
+	opos_q_count = 0;
+	opos_drop_count = 0;
+	posReady = 0;
+	posBuffer[0] = '\0';
+	__set_PRIMASK(primask);
+
+	// Preserve the current pose until the requested camera update arrives, then
+	// accept that first measurement as an absolute post-reset pose.
+	camera_state = CAMERA_IDLE;
+	camera_saved_pwm_l = MOTOR_PWM_STOP;
+	camera_saved_pwm_r = MOTOR_PWM_STOP;
+	camera_saved_command = 'X';
+	camera_saved_goto_state = GOTO_IDLE;
+	initial_pos = 1;
+	cam_due = 1;
+	broadcastPOS_due = 1;
+	broadcastMAP_due = 1;
+	debug_due = 1;
+
+	command = 'X';
+	new_cmd = 0;
+}
+
 void handle_command(void)
 {
 	if (command != 'X')
 	{
-		if (command == 'S')
+		if (command == 'H')
+		{
+			experiment_reset();
+		}
+		else if (command == 'S')
 		{
 			// no initialization
 			// stops the motors in 1 step and done
 			Motors_Stop(&motors);
+			path_len = 0;
+			path_idx = 0;
+			// S is a deliberate manual deactivation. Keep reporting INACTIVE so
+			// the supervisor does not wait for this selected robot forever.
+			goto_state = GOTO_INACTIVE;
+			debug_due = 1;
 			command = 'X';
 			new_cmd = 0;
 		}
@@ -1383,11 +1917,14 @@ void handle_command(void)
 		{
 			if (new_cmd)
 			{
-				// assumes visits_map to be initialized to 0 TODO: implement and call visit_map_init()
-				visits_map[0][0] = 1000.0f; // mark table marker place az visited
-				obstacles_map[0][0] = 1.0f; // mark table marker place az obstacle
+				accept_peer_maps = 1;
+				obstacles_map[0][0] = 1.0f; // known table-marker obstacle; it is not a visit
+				last_visit_r = -1;
+				last_visit_c = -1;
+				broadcastPOS_due = 1;
+				broadcastMAP_due = 1;
 				goto_state = GOTO_DONE;   // wait to first select a cell in goto_done, then start the algorithm from there
-				new_cmd = 0; // reset new_cmd flag
+				new_cmd = 0;
 			}
 			// copy robot_x and robot_y to local x,y
 			uint32_t primask = __get_PRIMASK();
@@ -1397,66 +1934,114 @@ void handle_command(void)
 			y = robot_y;
 			th = robot_theta;
 			__set_PRIMASK(primask);
-			// mark current place as visited for this robot and other known robots
+			// mark the current place as visited; peer maps arrive in OPOS messages
 			visits_map_update(x, y);
-			for (int i = 0; i < n_other_robots; i++)
-			{
-				visits_map_update(other_robots[i][0], other_robots[i][1]);
-			}
 
-			if (goto_state == GOTO_DONE)
+			uint32_t now_ms = HAL_GetTick();
+			if (goto_state == GOTO_DONE ||
+					(goto_state == GOTO_INACTIVE &&
+					 (int32_t)(now_ms - inactive_recheck_ms) >= 0))
 			{
-				// find the next best cell to go
-//				float best_x, best_y; //local var for best cell coordinates
-				int closer_bots_f = 0; // number of other_robots that are closer to the potential best cell
-				float fittest = -1; // fitness value to be maximised, initially -1
-				float Ar, R, D, Dbar,fitness,dist,angle,cx,cy; // Ar = A reverse, D = distance to self, Dbar = distance to other robots
-				uint8_t unvisited = 0; // number of unvisited cells, important for both:
-				                       // 1. termination condition and also,
-				                       // 2. for the last cells, closer robots attemp to visit them
-	            // evaluates fitness for every cell on the grid
-				for (int r = 0; r < 4; r++) // TODO: param
+				int active_peers = active_peer_count(now_ms);
+				int sc = round_nearest((x - X0) / CELL);
+				int sr = round_nearest((y - Y0) / CELL);
+				uint8_t topology_reachable[ROWS][COLS];
+				uint8_t route_reachable[ROWS][COLS];
+				if (sc < 0) sc = 0;
+				if (sc >= COLS) sc = COLS - 1;
+				if (sr < 0) sr = 0;
+				if (sr >= ROWS) sr = ROWS - 1;
+				// Static topology decides whether this robot has any work at all.
+				// Fresh peer cells are blocked only for the route used right now, so
+				// moving robots cause a detour without becoming permanent obstacles.
+				(void)compute_reachable_cells(sr, sc, topology_reachable, 0u, now_ms);
+				(void)compute_reachable_cells(sr, sc, route_reachable, 1u, now_ms);
+
+				// Only peers in this connected component compete for its remaining
+				// cells. Peers behind a static obstacle must not make this robot yield.
+				int competing_robots = 1;
+				for (int i = 0; i < n_other_robots; i++)
 				{
-					for (int c = 0; c < 11; c++) // TODO: param
+					int peer_r, peer_c;
+					if (peer_is_fresh(i, now_ms) &&
+							world_to_cell(other_robots[i][0], other_robots[i][1],
+									&peer_r, &peer_c) &&
+							topology_reachable[peer_r][peer_c])
+						competing_robots++;
+				}
+
+				// find the next best cell to go
+				float fittest = -1; // fitness value to be maximised, initially -1
+				uint8_t have_candidate = 0;
+				uint32_t tie_count = 0;
+				float Ar, R, D, Dbar, fitness, dist, heading_error, cx, cy;
+				uint8_t reachable_unvisited = 0;
+	            // evaluates fitness for every cell on the grid
+				for (int r = 0; r < ROWS; r++)
+				{
+					for (int c = 0; c < COLS; c++)
 					{
 						// skip obstacle cells entirely
 						if (obstacles_map[r][c] >= 1.0f) {
 						    continue;
 						}
-						// if cell r,c is unvisited, mark it
-						if (visits_map[r][c] < 1)
-							unvisited += 1;
-						// TODO: param - SCE coefficinets must be config parameters and not hard coded!
-						// A = 1/(visits + penalties)
-						// Ar = (1/A)
-						Ar = fpow_simple(visits_map[r][c] + penalties_map[r][c], 8) + 1.0f; // Ar^kappa
-						// center of the cell
-						cx = c * 0.15f + 0.15f; // + 0.15 => 0.75f (half cell) + 0.75f (safety not to cover the marker)
-						cy = r * 0.15f + 0.15f; // + 0.15 => 0.75f (half cell) + 0.75f (safety not to cover the marker)
+						// Coverage targets must be both unvisited and connected to the
+						// robot through the current static-obstacle topology.
+						if (visits_map[r][c] >= 1.0f || !topology_reachable[r][c])
+							continue;
+						reachable_unvisited++;
+
+						// Select only cells reachable without crossing a fresh peer pose.
+						if (!route_reachable[r][c])
+							continue;
+
+						// Never select a cell that a peer currently occupies. This is
+						// live collision avoidance, not a reservation of future cells.
+						if (cell_is_occupied_by_peer(r, c, now_ms))
+							continue;
+
+						cell_center(r, c, &cx, &cy);
 						dist = dist_to_target(x, y, cx, cy); // direct distance
-						angle = desired_theta_to_target(x, y, th, cx, cy);
-						if (dist < 0.075f) // TODO: param - make 0.075 (half cell size) a confid parameter
+						if (dist < (CELL * 0.5f))
 							continue; // avoid singularity and too close cells
-						D = fpow_simple(dist, 4); // D^mu
-						R = 1+2.0f*fabsf(angle); // add angle difference penalty, TODO: param - make the weight of angle penalty a config parameter
-						Dbar = 1;
-						int closer_bots = 0;
+
+						// Eq. (1) and Eq. (4): A^kappa = 1/(V + P + 1)^kappa.
+						Ar = fpow_simple(visits_map[r][c] + penalties_map[r][c] + 1.0f,
+								SCE_KAPPA);
+						D = fpow_simple(dist, SCE_MU);
+						Dbar = 0.0f;
 						for (int i = 0; i < n_other_robots; i++)
 						{
+							if (!peer_is_fresh(i, now_ms)) continue;
 							float dist_to_other_robot = dist_to_target(other_robots[i][0], other_robots[i][1], cx, cy);
 							Dbar += dist_to_other_robot;
-							if (dist_to_other_robot < dist)
-								closer_bots++;
 						}
-						Dbar = fpow_simple(Dbar, 4); // Dbar^lambda
-						fitness = (Dbar*R) / (Ar*D); // F = A^kappa * Dbar^mu / D^lambda = Dbar^mu / (Ar^kappa * D^mu)
-						if (fitness>fittest && dist>=0.075f) //TODO: param -make 0.075 (half cell size) a confid parameter
+						if (active_peers == 0) Dbar = 1.0f; // neutral dispersion term for one robot
+						Dbar = fpow_simple(Dbar, SCE_LAMBDA);
+
+						// Preserve the physical robot's straight-line preference while SCE
+						// remains the coverage score. This avoids unnecessary stop-turn cycles.
+						heading_error = heading_error_to_target(x, y, th, cx, cy);
+						R = 1.0f + SCE_HEADING_WEIGHT * fabsf(heading_error) / (float)M_PI;
+						fitness = Dbar / (Ar * D * R);
+
+						float tie_epsilon = SCE_FITNESS_TIE_EPS * (1.0f + fabsf(fittest));
+						int choose = 0;
+						if (!have_candidate || fitness > fittest + tie_epsilon)
 						{
-							// cell can be selected if it is NOT too close
+							choose = 1;
+							tie_count = 1;
+						}
+						else if (fittest > 0.0f && fabsf(fitness - fittest) <= tie_epsilon)
+						{
+							tie_count++;
+							choose = ((sce_random() % tie_count) == 0u);
+						}
+
+						if (choose)
+						{
+							have_candidate = 1;
 							fittest = fitness; // candidate this cell as the best cell so far (inc. its properties)
-							closer_bots_f = closer_bots;
-//							best_x = cx;
-//							best_y = cy;
 							// index of the best cell for penalties (global)
 							xt_i = c;
 							yt_i = r;
@@ -1464,40 +2049,77 @@ void handle_command(void)
 					}
 				}
 
-				// if number of unvisited cells are less than the number of robots,
-				// this robot should avoid moving if it is not the closest bot to the unvisited target cell
-				if (unvisited < (n_other_robots+1) && closer_bots_f>0)
-					fittest = -1;
-				if (obstacles_map[yt_i][xt_i] >= 1.0f)
-				    fittest = -1;
-				// fitness may not be -1 (no cell is celected, or the selected cell was not valid)
-				if (fittest > 0)
+				// When fewer reachable cells remain than competing robots, only the
+				// closest robot should pursue each selected final cell. A deterministic
+				// MID tie-break prevents equal-distance robots from both yielding.
+				uint8_t yield_final_cells = 0;
+				if (reachable_unvisited < competing_robots)
 				{
-					// current robot cell
-					int sc = round_nearest((x - X0) / CELL);
-					int sr = round_nearest((y - Y0) / CELL);
-					if (sc < 0) sc = 0;
-					if (sc >= COLS) sc = COLS - 1;
-					if (sr < 0) sr = 0;
-					if (sr >= ROWS) sr = ROWS - 1;
+					if (!have_candidate)
+					{
+						yield_final_cells = 1;
+					}
+					else
+					{
+						cell_center(yt_i, xt_i, &cx, &cy);
+						float own_dist = dist_to_target(x, y, cx, cy);
+						for (int i = 0; i < n_other_robots; i++)
+						{
+							int peer_r, peer_c;
+							if (!peer_is_fresh(i, now_ms) ||
+									!world_to_cell(other_robots[i][0], other_robots[i][1],
+											&peer_r, &peer_c) ||
+									!topology_reachable[peer_r][peer_c])
+								continue;
 
-					// plan
-					if (!astar_plan_cells(sr, sc, yt_i, xt_i)) {
-					    penalize_target_cell();
-					    fittest = -1; // force reselect next cycle
-					} else {
-					    cell_center(path_r[0], path_c[0], &xt, &yt);
-					    Motors_Stop(&motors);
-					    goto_state = GOTO_ROTATE;
+							float peer_dist = dist_to_target(other_robots[i][0],
+									other_robots[i][1], cx, cy);
+							if (peer_dist + FINAL_CELL_DISTANCE_TIE_M < own_dist ||
+									(fabsf(peer_dist - own_dist) <=
+											FINAL_CELL_DISTANCE_TIE_M &&
+									 other_robots_ids[i] < MID))
+							{
+								yield_final_cells = 1;
+								break;
+							}
+						}
 					}
 				}
 
-				// check the termination condition
-				if (unvisited == 0)
+				if (have_candidate && !yield_final_cells)
 				{
-					// when done, clear command
-					goto_state = GOTO_IDLE;
-					command = 'X';
+					// plan
+					if (!astar_plan_cells(sr, sc, yt_i, xt_i)) {
+					    // A peer may have moved after the reachability snapshot. Retry
+					    // without penalising an otherwise valid coverage target.
+					    path_len = 0;
+					    path_idx = 0;
+					    goto_state = GOTO_DONE;
+					} else {
+					    cell_center(path_r[0], path_c[0], &xt, &yt);
+					    Motors_Stop(&motors);
+					    goto_rotate_started_ms = now_ms;
+					    goto_state = GOTO_ROTATE;
+					    debug_due = 1;
+					}
+				}
+				else if (reachable_unvisited == 0 || yield_final_cells)
+				{
+					// Either this component is complete or a closer peer owns the scarce
+					// final work. Keep Q alive so map/pose updates can reactivate us.
+					Motors_Stop(&motors);
+					path_len = 0;
+					path_idx = 0;
+					if (goto_state != GOTO_INACTIVE)
+						debug_due = 1;
+					goto_state = GOTO_INACTIVE;
+					inactive_recheck_ms = now_ms + INACTIVE_RECHECK_MS;
+				}
+				else
+				{
+					// Reachable work exists but every candidate is temporarily occupied
+					// by a peer. Stay ready and retry without claiming inactivity.
+					goto_state = GOTO_DONE;
 				}
 			}
 
@@ -1507,39 +2129,73 @@ void handle_command(void)
 	}
 }
 
-// check oposReady flag
-// copies posBuffer to local
-// expects OPOS#id#x#y#[r#c]...
-// if other_robots_ids contains id,
-//     updates other_robots[0] and [1] by ox and oy
-// else
-//     if n_other_robots < MAX_OTHER_ROBOTS
-//         	n_other_robots++;
-//          updates other_robots[0] and [1] by ox and oy
-// then parses the rest of the string in [r#c] format and uodates visits_map
-void handle_opos_if_ready(void)
+static int opos_queue_pop(char *dst, size_t dst_size)
 {
-	if (!oposReady) return;
+	int have_message = 0;
+	uint32_t primask = __get_PRIMASK();
+	__disable_irq();
 
-	char local[256];
-
+	if (opos_q_count > 0)
 	{
-		uint32_t primask = __get_PRIMASK();
-		__disable_irq();
-		oposReady = 0;
-		strncpy(local, oposBuffer, sizeof(local));
-		local[sizeof(local) - 1] = '\0';
-		__set_PRIMASK(primask);
+		uint8_t slot = opos_q_tail;
+		strncpy(dst, opos_queue[slot], dst_size);
+		dst[dst_size - 1] = '\0';
+		opos_q_tail = (uint8_t)((slot + 1u) % OPOS_QUEUE_DEPTH);
+		opos_q_count--;
+		have_message = 1;
 	}
 
-	// Expect: OPOS#id#x#y#[r#c]...
-	// Tokenize by '#'
+	__set_PRIMASK(primask);
+	return have_message;
+}
+
+static int parse_row_mask(const char *token, uint16_t *mask)
+{
+	char *end = NULL;
+	unsigned long value = strtoul(token, &end, 16);
+	unsigned long valid_bits = (1UL << COLS) - 1UL;
+
+	if (end == token || *end != '\0' || value > valid_bits)
+		return 0;
+
+	*mask = (uint16_t)value;
+	return 1;
+}
+
+static void merge_full_maps(const uint16_t visit_masks[ROWS],
+		const uint16_t obstacle_masks[ROWS])
+{
+	for (int r = 0; r < ROWS; r++)
+	{
+		for (int c = 0; c < COLS; c++)
+		{
+			uint16_t bit = (uint16_t)(1u << c);
+			if (visit_masks[r] & bit)
+				visits_map[r][c] = MAX_VISIT_AND_PENALTY_COUNT;
+
+			// A visit, whether local or received, proves that this cell is
+			// traversable and therefore overrides every obstacle report.
+			if (visits_map[r][c] >= 1.0f)
+				obstacles_map[r][c] = 0.0f;
+			else if (obstacle_masks[r] & bit)
+				obstacles_map[r][c] = 1.0f;
+		}
+	}
+}
+
+static void handle_opos_line(char *local)
+{
 	char *save = NULL;
 	char *tok = strtok_r(local, "#", &save);
 	if (!tok || strcmp(tok, "OPOS") != 0) return;
 
 	tok = strtok_r(NULL, "#", &save); if (!tok) return;
-	int id = atoi(tok);
+	char *id_end = NULL;
+	long parsed_id = strtol(tok, &id_end, 10);
+	if (id_end == tok || *id_end != '\0' || parsed_id < 0 || parsed_id > 255 ||
+			parsed_id == MID || parsed_id == INVALID_MID)
+		return;
+	uint8_t id = (uint8_t)parsed_id;
 
 	tok = strtok_r(NULL, "#", &save); if (!tok) return;
 	float ox = (float)atof(tok);
@@ -1547,49 +2203,130 @@ void handle_opos_if_ready(void)
 	tok = strtok_r(NULL, "#", &save); if (!tok) return;
 	float oy = (float)atof(tok);
 
-	// update other_robots list (same as your logic)
-	int found = 0;
-	for (int i = 0; i < n_other_robots; i++) {
-		if (other_robots_ids[i] == id) {
-			other_robots[i][0] = ox;
-			other_robots[i][1] = oy;
-			found = 1;
+	int peer_index = -1;
+	for (int i = 0; i < n_other_robots; i++)
+	{
+		if (other_robots_ids[i] == id)
+		{
+			peer_index = i;
 			break;
 		}
 	}
-	if (!found && n_other_robots < MAX_OTHER_ROBOTS) {
-		other_robots_ids[n_other_robots] = id;
-		other_robots[n_other_robots][0] = ox;
-		other_robots[n_other_robots][1] = oy;
+	if (peer_index < 0 && n_other_robots < MAX_OTHER_ROBOTS)
+	{
+		peer_index = n_other_robots;
+		other_robots_ids[peer_index] = id;
 		n_other_robots++;
 	}
+	if (peer_index >= 0)
+	{
+		other_robots[peer_index][0] = ox;
+		other_robots[peer_index][1] = oy;
+		other_robots_last_seen_ms[peer_index] = HAL_GetTick();
+	}
 
-	// Parse remaining tokens as (r,c) pairs
-	while (1) {
-		char *tr = strtok_r(NULL, "#", &save);
-		if (!tr) break;
+	// M1 carries one visited bitmap and one obstacle bitmap for every grid row.
+	tok = strtok_r(NULL, "#", &save);
+	if (tok && strcmp(tok, "P1") == 0)
+		return;
+
+	if (tok && strcmp(tok, "M1") == 0)
+	{
+		// H resets experiment memory and closes this gate. Continue accepting
+		// pose-only information while idle, but never merge a previous run's map.
+		if (!accept_peer_maps)
+			return;
+
+		uint16_t visit_masks[ROWS];
+		uint16_t obstacle_masks[ROWS];
+
+		tok = strtok_r(NULL, "#", &save);
+		if (!tok || strcmp(tok, "V") != 0) return;
+		for (int r = 0; r < ROWS; r++)
+		{
+			tok = strtok_r(NULL, "#", &save);
+			if (!tok || !parse_row_mask(tok, &visit_masks[r])) return;
+		}
+
+		tok = strtok_r(NULL, "#", &save);
+		if (!tok || strcmp(tok, "O") != 0) return;
+		for (int r = 0; r < ROWS; r++)
+		{
+			tok = strtok_r(NULL, "#", &save);
+			if (!tok || !parse_row_mask(tok, &obstacle_masks[r])) return;
+		}
+
+		int route_active = (command == 'Q' &&
+				(goto_state == GOTO_ROTATE || goto_state == GOTO_DRIVE));
+		int target_was_visited = 1;
+		int next_was_blocked = 1;
+		int next_r = -1;
+		int next_c = -1;
+
+		if (route_active)
+		{
+			target_was_visited = (visits_map[yt_i][xt_i] >= 1.0f);
+			if (path_idx < path_len)
+			{
+				next_r = path_r[path_idx];
+				next_c = path_c[path_idx];
+				next_was_blocked = (obstacles_map[next_r][next_c] >= 1.0f);
+			}
+		}
+
+		merge_full_maps(visit_masks, obstacle_masks);
+
+		// Do not finish a route whose target another robot has just covered.
+		// Likewise, abandon a route when a newly shared obstacle blocks its
+		// next step. The next main-loop pass performs a fresh SCE selection.
+		if (route_active &&
+				((!target_was_visited && visits_map[yt_i][xt_i] >= 1.0f) ||
+				 (!next_was_blocked && next_r >= 0 &&
+						obstacles_map[next_r][next_c] >= 1.0f)))
+		{
+			Motors_Stop(&motors);
+			path_len = 0;
+			path_idx = 0;
+			goto_state = GOTO_DONE;
+		}
+		return;
+	}
+
+	// Backward compatibility with legacy OPOS#id#x#y#[r#c]... packets.
+	while (tok)
+	{
+		char *tr = tok;
 		char *tc = strtok_r(NULL, "#", &save);
 		if (!tc) break;
 
-		int r = atoi(tr);
-		int c = atoi(tc);
-		if (r < 0 || r >= ROWS) continue;
-		if (c < 0 || c >= COLS) continue;
-		// do the update directlt here
-		if (visits_map[r][c] < MAX_VISIT_AND_PENALTY_COUNT)
-			visits_map[r][c] += 1.0f;
+		char *r_end = NULL;
+		char *c_end = NULL;
+		long r = strtol(tr, &r_end, 10);
+		long c = strtol(tc, &c_end, 10);
+		if (r_end != tr && *r_end == '\0' && c_end != tc && *c_end == '\0' &&
+				r >= 0 && r < ROWS && c >= 0 && c < COLS)
+			visits_map[r][c] = MAX_VISIT_AND_PENALTY_COUNT;
+
+		tok = strtok_r(NULL, "#", &save);
 	}
 }
 
-// sends current pos as "BPOS#%d#%.3f#%.3f" to Serial for ESP
-// sends the latest updates on the visits map as "#%d#%d" to Serial
-// ESP will do a UDP broadcast
-void broadcast_pos(void)
+// Drain all queued peer messages so a complete multi-robot burst is processed.
+void handle_opos_if_ready(void)
+{
+	char local[OPOS_MESSAGE_SIZE];
+	while (opos_queue_pop(local, sizeof(local)))
+		handle_opos_line(local);
+}
+
+// Sends a fast pose-only packet or a slower full SCE state packet.
+void broadcast_pos(uint8_t include_maps)
 {
 	char tx[256];
 	int len = 0;
+	uint16_t visit_masks[ROWS] = {0};
+	uint16_t obstacle_masks[ROWS] = {0};
 
-	// atomic snapshot of pos (if you still want x,y for "current position" use)
 	float x, y;
 	{
 		uint32_t primask = __get_PRIMASK();
@@ -1599,35 +2336,51 @@ void broadcast_pos(void)
 		__set_PRIMASK(primask);
 	}
 
-	// atomic snapshot of recovery cells
-	int16_t snap[REC_WINDOW][2];
+	if (!include_maps)
 	{
-		uint32_t primask = __get_PRIMASK();
-		__disable_irq();
-		for (int i = 0; i < REC_WINDOW; i++) {
-			snap[i][0] = rec_cells[i][0];
-			snap[i][1] = rec_cells[i][1];
-		}
-		__set_PRIMASK(primask);
+		len = snprintf(tx, sizeof(tx), "BPOS#%d#%.3f#%.3f#P1\n", MID, x, y);
+		if (len > 0 && len < (int)sizeof(tx))
+			HAL_UART_Transmit(&huart1, (uint8_t*)tx, (uint16_t)len, 50);
+		return;
 	}
 
-	// base
-	len = snprintf(tx, sizeof(tx), "BPOS#%d#%.3f#%.3f", MID, x, y);
+	for (int r = 0; r < ROWS; r++)
+	{
+		for (int c = 0; c < COLS; c++)
+		{
+			uint16_t bit = (uint16_t)(1u << c);
+			if (visits_map[r][c] >= 1.0f)
+				visit_masks[r] |= bit;
+			else if (obstacles_map[r][c] >= 1.0f)
+				obstacle_masks[r] |= bit;
+		}
+	}
+
+	len = snprintf(tx, sizeof(tx), "BPOS#%d#%.3f#%.3f#M1#V", MID, x, y);
 	if (len < 0 || len >= (int)sizeof(tx)) return;
 
-	// order is not important
-	for (int k = 0; k < REC_WINDOW; k++) {
-		int r = snap[k][0];
-		int c = snap[k][1];
-		if (r < 0 || c < 0)
-			break; // skip the rest, this will happen only at the beginning that the window is not full
-
-		int n = snprintf(tx + len, sizeof(tx) - (size_t)len, "#%d#%d", r, c);
-		if (n < 0 || n >= (int)(sizeof(tx) - (size_t)len)) break;
+	for (int r = 0; r < ROWS; r++)
+	{
+		int n = snprintf(tx + len, sizeof(tx) - (size_t)len, "#%03X",
+				(unsigned int)visit_masks[r]);
+		if (n < 0 || n >= (int)(sizeof(tx) - (size_t)len)) return;
 		len += n;
 	}
 
-	// newline
+	{
+		int n = snprintf(tx + len, sizeof(tx) - (size_t)len, "#O");
+		if (n < 0 || n >= (int)(sizeof(tx) - (size_t)len)) return;
+		len += n;
+	}
+
+	for (int r = 0; r < ROWS; r++)
+	{
+		int n = snprintf(tx + len, sizeof(tx) - (size_t)len, "#%03X",
+				(unsigned int)obstacle_masks[r]);
+		if (n < 0 || n >= (int)(sizeof(tx) - (size_t)len)) return;
+		len += n;
+	}
+
 	if (len < (int)sizeof(tx) - 2) {
 		tx[len++] = '\n';
 		tx[len] = '\0';
@@ -1700,48 +2453,70 @@ int main(void)
 	// set timer interrupt for odom and cam pos poll
 	HAL_TIM_Base_Start_IT(&htim10);
 
-	rec_init(); // init recovery window for broadcasts
-
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 	while (1)
 	{
-		uint32_t odom_n = 0, cam_n = 0, broadcastPOS_n = 0;
+		uint32_t odom_n = 0, cam_n = 0, broadcastPOS_n = 0, broadcastMAP_n = 0;
+		uint8_t debug_n = 0;
 		uint32_t primask = __get_PRIMASK();
 		__disable_irq();
 		odom_n = odom_due;  odom_due = 0;
 		cam_n = cam_due;   cam_due = 0;
 		broadcastPOS_n = broadcastPOS_due; broadcastPOS_due = 0;
+		broadcastMAP_n = broadcastMAP_due; broadcastMAP_due = 0;
+		debug_n = debug_due; debug_due = 0;
 		__set_PRIMASK(primask);
 
 		// if requested, update odometry
 		if (odom_n>0) {
 			update_odometry(); // very quick, just reads encoder counts and does odom calculations
 		}
-		// if requested, update from cam pos
-		if (cam_n)
-		{
-			request_camera_correction(); // stops the robot, then continues moving
-		}
-		// if due time, broadcast pos to wifi module
-		if (broadcastPOS_n)
-		{
-			broadcast_pos();
-			debug_send_state();
-		}
-
 		// receive and parse commands if cmdReady flag is set
 		// uses cmdBuffer
 		// sets command var and params array and new_cmd flag
 		parse_command_if_ready();
+		// Reset must not wait behind an in-flight camera correction. This also
+		// guarantees that motors stop before any lower-priority serial/debug work.
+		if (command == 'H')
+			experiment_reset();
 
 		// handle other robots pos if available
 		handle_opos_if_ready();
 
-		// handle commands
-		handle_command();
+		// Interpret every completed IR scan, regardless of navigation state. Peer
+		// messages are handled first so robot/static classification uses fresh poses.
+		obstacle_status_update();
+
+		// A full map packet also contains the current pose, so avoid a duplicate packet.
+		if (broadcastMAP_n)
+		{
+			broadcast_pos(1);
+		}
+		else if (broadcastPOS_n)
+		{
+			broadcast_pos(0);
+		}
+
+		// This advances without blocking, so peer position exchange and sensing keep
+		// running throughout camera settling and response waits.
+		camera_correction_step((cam_n > 0) ? 1u : 0u);
+
+		// Large debug frames are deferred while the ESP is synchronously obtaining a
+		// camera pose; compact BPOS/M1 traffic above continues during that interval.
+		if (debug_n)
+		{
+			if (camera_correction_busy())
+				debug_due = 1;
+			else
+				debug_send_state();
+		}
+
+		// Keep motors settled until the non-blocking camera correction finishes.
+		if (!camera_correction_busy())
+			handle_command();
 
     /* USER CODE END WHILE */
 
